@@ -1,0 +1,13 @@
+.DS_Store
+.claude/
+
+# Android build artifacts
+Android/gradle-home-short/
+Android/src/build/
+Android/src/app/build/
+Android/src/.gradle/
+Android/src/android-user-home/
+*.apk
+
+# Native libs (too large for git)
+Android/src/app/src/main/jniLibs/
