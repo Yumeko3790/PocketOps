@@ -1334,6 +1334,9 @@ fun PocketOpsApp(
     val knowledgeGraph = remember { MaintenanceKnowledgeGraph() }
     val conversationHistory = remember { mutableStateListOf<Pair<String, String>>() }
     var activeEquipmentContext by remember { mutableStateOf<GraphNode?>(null) }
+    var latestVisualContextText by remember { mutableStateOf("") }
+    var latestVisualEquipmentContext by remember { mutableStateOf<GraphNode?>(null) }
+    var visualLookupScopeActive by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     var showBluetoothDialog by remember { mutableStateOf(false) }
     var selectedWorkOrderMessage by remember { mutableStateOf<PocketMessage?>(null) }
@@ -1606,6 +1609,9 @@ fun PocketOpsApp(
     fun clearDiagnosisContextAfterWorkOrder() {
         conversationHistory.clear()
         activeEquipmentContext = null
+        latestVisualContextText = ""
+        latestVisualEquipmentContext = null
+        visualLookupScopeActive = false
     }
 
     // Send logic — unified multi-turn with image / video context
@@ -1664,6 +1670,13 @@ fun PocketOpsApp(
 
                 // Image: HTTP VLM (NPU accelerated via embedded GenieHttpService)
                 if (visualBitmap != null) {
+                    withContext(Dispatchers.Main) {
+                        conversationHistory.clear()
+                        activeEquipmentContext = null
+                        latestVisualContextText = ""
+                        latestVisualEquipmentContext = null
+                        visualLookupScopeActive = false
+                    }
                     if (videoUri == null) {
                         withContext(Dispatchers.Main) {
                             messages.add(PocketMessage(text = "\u6b63\u5728\u4f7f\u7528\u7aef\u4fa7\u6a21\u578b\u5206\u6790\u56fe\u7247...", isUser = false, isImageResponse = true))
@@ -1712,9 +1725,11 @@ fun PocketOpsApp(
                         withContext(Dispatchers.Main) {
                             val idx = messages.size - 1
                             if (idx >= 0) messages[idx] = messages[idx].copy(text = content)
-                            knowledgeGraph.findEquipment(content).firstOrNull()?.let { matchedEquipment ->
-                                activeEquipmentContext = matchedEquipment
-                            }
+                            val matchedEquipment = knowledgeGraph.findEquipment(content).firstOrNull()
+                            latestVisualContextText = "$visualHistoryLabel\n$content"
+                            latestVisualEquipmentContext = matchedEquipment
+                            visualLookupScopeActive = true
+                            activeEquipmentContext = matchedEquipment
                         }
                         conversationHistory.add("user" to visualHistoryLabel)
                         conversationHistory.add("assistant" to content)
@@ -1733,7 +1748,18 @@ fun PocketOpsApp(
                 // Check GraphRAG first. Try the current turn first, then include recent
                 // conversation so image-recognized identifiers can be used in follow-ups.
                 val retrievalText = buildConversationRetrievalText(userText, conversationHistory)
-                val contextualRetrievalText = buildEquipmentContextRetrievalText(userText, retrievalText, equipmentContextForTurn)
+                val visualLookupText =
+                    if (visualLookupScopeActive) {
+                        buildEquipmentContextRetrievalText(userText, latestVisualContextText, latestVisualEquipmentContext)
+                    } else {
+                        ""
+                    }
+                val contextualRetrievalText =
+                    if (isEquipmentLookupQuestion(userText) && visualLookupScopeActive && visualLookupText.isNotBlank()) {
+                        visualLookupText
+                    } else {
+                        buildEquipmentContextRetrievalText(userText, retrievalText, equipmentContextForTurn)
+                    }
                 Log.d(TAG, "GraphRAG check: '${userText}', nodes=${knowledgeGraph.getNodeCount()}")
                 val graphResult =
                     buildGraphRAGReport(userText, knowledgeGraph)
@@ -1745,6 +1771,7 @@ fun PocketOpsApp(
                     withContext(Dispatchers.Main) {
                         messages.add(PocketMessage(text = "", isUser = false, report = report, graphJson = graphJson))
                         activeEquipmentContext = report.equipment
+                        visualLookupScopeActive = false
                     }
                     conversationHistory.add("user" to userText)
                     conversationHistory.add("assistant" to buildDiagnosticReportText(report))
@@ -1760,10 +1787,22 @@ fun PocketOpsApp(
                     withContext(Dispatchers.Main) {
                         messages.add(PocketMessage(text = equipmentLookupAnswer, isUser = false))
                         activeEquipmentContext = matchedEquipment
+                        visualLookupScopeActive = false
                     }
                     conversationHistory.add("user" to userText)
                     conversationHistory.add("assistant" to equipmentLookupAnswer)
                     appendHistory(userText, equipmentLookupAnswer)
+                    return@launch
+                }
+
+                if (isEquipmentLookupQuestion(userText) && visualLookupScopeActive) {
+                    val answer = "最近一次图片或视频里暂未匹配到知识库中的具体叉车编号。请补拍包含设备编号、配置号或铭牌的画面，或直接输入设备编号。"
+                    withContext(Dispatchers.Main) {
+                        messages.add(PocketMessage(text = answer, isUser = false))
+                    }
+                    conversationHistory.add("user" to userText)
+                    conversationHistory.add("assistant" to answer)
+                    appendHistory(userText, answer)
                     return@launch
                 }
 
@@ -1850,6 +1889,7 @@ fun PocketOpsApp(
                 withContext(Dispatchers.Main) {
                     val idx = messages.size - 1
                     if (idx >= 0) messages[idx] = messages[idx].copy(text = llmContent, relatedWorkOrders = relatedWOs)
+                    visualLookupScopeActive = false
                 }
                 conversationHistory.add("user" to userText)
                 conversationHistory.add("assistant" to llmContent)
@@ -1909,6 +1949,9 @@ fun PocketOpsApp(
                         messages.clear()
                         conversationHistory.clear()
                         activeEquipmentContext = null
+                        latestVisualContextText = ""
+                        latestVisualEquipmentContext = null
+                        visualLookupScopeActive = false
                         selectedWorkOrderMessage = null
                     }
                 },
@@ -2159,6 +2202,9 @@ fun PocketOpsApp(
                 conversationHistory.add("user" to entry.userText)
                 conversationHistory.add("assistant" to entry.aiText)
                 activeEquipmentContext = knowledgeGraph.findEquipment("${entry.userText}\n${entry.aiText}").firstOrNull() ?: activeEquipmentContext
+                latestVisualContextText = ""
+                latestVisualEquipmentContext = null
+                visualLookupScopeActive = false
             },
         )
     }
