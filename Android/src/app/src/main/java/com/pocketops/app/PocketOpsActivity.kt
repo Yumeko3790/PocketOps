@@ -1603,6 +1603,11 @@ fun PocketOpsApp(
         scope.launch(Dispatchers.IO) { saveHistory(context, diagnosisHistory.toList()) }
     }
 
+    fun clearDiagnosisContextAfterWorkOrder() {
+        conversationHistory.clear()
+        activeEquipmentContext = null
+    }
+
     // Send logic — unified multi-turn with image / video context
     fun sendMessage(text: String, bitmap: Bitmap?, videoUri: Uri? = null) {
         if (text.isBlank() && bitmap == null && videoUri == null) return
@@ -2128,6 +2133,7 @@ fun PocketOpsApp(
             demoServerBaseUrl = demoServerBaseUrl,
             session = session,
             onSaveRecord = { userText, aiText -> appendHistory(userText, aiText) },
+            onWorkOrderCompleted = { clearDiagnosisContextAfterWorkOrder() },
             onDismiss = { selectedWorkOrderMessage = null },
         )
     }
@@ -2902,6 +2908,7 @@ private fun WorkOrderDialog(
     demoServerBaseUrl: String,
     session: PocketOpsSession,
     onSaveRecord: (String, String) -> Unit,
+    onWorkOrderCompleted: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -2926,6 +2933,11 @@ private fun WorkOrderDialog(
     val createdAt = remember(message.text, message.report) {
         SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
     }
+
+    LaunchedEffect(workOrderId) {
+        onWorkOrderCompleted()
+    }
+
     val editedWorkOrder =
         WorkOrderDocumentData(
             equipment = equipment.trim(),
@@ -2957,6 +2969,7 @@ private fun WorkOrderDialog(
             recordText,
         )
         lastSavedRecordText = recordText
+        onWorkOrderCompleted()
         return true
     }
 
@@ -3094,6 +3107,7 @@ private fun WorkOrderDialog(
                         )
                     ) {
                         saveEditedRecordIfChanged()
+                        onWorkOrderCompleted()
                         onDismiss()
                     }
                 },
