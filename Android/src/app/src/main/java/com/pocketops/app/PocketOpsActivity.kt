@@ -68,6 +68,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -132,11 +133,11 @@ private enum class RemoteBootstrapState {
 private fun runtimeStatusLine(genieReady: Boolean, remoteState: RemoteBootstrapState): String {
     if (!genieReady) return "系统初始化中"
     return when (remoteState) {
-        RemoteBootstrapState.CONNECTED -> "本机推理已就绪 · 已连接电脑服务"
-        RemoteBootstrapState.CACHED_FALLBACK -> "本机推理已就绪 · 使用缓存知识库"
-        RemoteBootstrapState.BUNDLED_FALLBACK -> "本机推理已就绪 · 使用本地知识库"
-        RemoteBootstrapState.CONNECTING -> "本机推理已就绪 · 正在检查电脑服务"
-        RemoteBootstrapState.NOT_CONFIGURED -> "本机推理已就绪 · 使用本地知识库"
+        RemoteBootstrapState.CONNECTED -> "就绪 · 电脑服务"
+        RemoteBootstrapState.CACHED_FALLBACK -> "就绪 · 缓存知识库"
+        RemoteBootstrapState.BUNDLED_FALLBACK -> "就绪 · 本地知识库"
+        RemoteBootstrapState.CONNECTING -> "就绪 · 检查电脑服务"
+        RemoteBootstrapState.NOT_CONFIGURED -> "就绪 · 本地知识库"
     }
 }
 
@@ -339,30 +340,6 @@ private fun LoadingStageCard(
                 }
             }
             StatusChip(statusText, accentColor.copy(alpha = 0.12f), accentColor)
-        }
-    }
-}
-
-@Composable
-private fun InputToolButton(
-    icon: ImageVector,
-    label: String,
-    enabled: Boolean,
-    onClick: () -> Unit,
-) {
-    Surface(
-        modifier = Modifier.clickable(enabled = enabled, onClick = onClick),
-        color = if (enabled) SurfaceMuted else SurfaceSoft,
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, BorderSoft),
-    ) {
-        Row(
-            Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(icon, label, tint = if (enabled) Accent else TextSubtle, modifier = Modifier.size(16.dp))
-            Spacer(Modifier.width(6.dp))
-            Text(label, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = if (enabled) TextBody else TextSubtle)
         }
     }
 }
@@ -1893,7 +1870,7 @@ fun PocketOpsApp(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         PocketOpsBadge(size = 36.dp, cornerRadius = 12.dp, iconSize = 18.dp)
                         Spacer(Modifier.width(10.dp))
-                        Column {
+                        Column(Modifier.widthIn(max = 138.dp)) {
                             Text("PocketOps", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = TextMain)
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Box(Modifier.size(6.dp).background(runtimeStatusColor(genieReady, remoteBootstrapState), CircleShape))
@@ -1903,6 +1880,8 @@ fun PocketOpsApp(
                                     fontSize = 11.sp,
                                     color = runtimeStatusColor(genieReady, remoteBootstrapState),
                                     fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
                         }
@@ -3994,6 +3973,7 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
     var pendingImage by remember { mutableStateOf<Bitmap?>(null) }
     var pendingVideoUri by remember { mutableStateOf<Uri?>(null) }
     var pendingVideoLabel by remember { mutableStateOf("") }
+    var showAttachmentMenu by remember { mutableStateOf(false) }
     val ctx = LocalContext.current
 
     val photoLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicturePreview()) { bmp ->
@@ -4075,27 +4055,53 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
                 }
             }
         }
-        Row(
-            Modifier
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            InputToolButton(icon = Icons.Default.AddAPhoto, label = "拍照", enabled = enabled) {
-                if (ctx.checkSelfPermission(android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                    photoLauncher.launch(null)
-                } else {
-                    cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.Bottom) {
+            Box {
+                IconButton(
+                    onClick = { showAttachmentMenu = true },
+                    enabled = enabled,
+                    modifier = Modifier
+                        .size(52.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(if (enabled) SurfaceMuted else SurfaceSoft),
+                ) {
+                    Icon(Icons.Default.Add, "添加现场资料", tint = if (enabled) Accent else TextSubtle)
+                }
+                DropdownMenu(
+                    expanded = showAttachmentMenu,
+                    onDismissRequest = { showAttachmentMenu = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("拍照") },
+                        leadingIcon = { Icon(Icons.Default.AddAPhoto, null) },
+                        onClick = {
+                            showAttachmentMenu = false
+                            if (ctx.checkSelfPermission(android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                photoLauncher.launch(null)
+                            } else {
+                                cameraPermissionLauncher.launch(android.Manifest.permission.CAMERA)
+                            }
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("导入图片") },
+                        leadingIcon = { Icon(Icons.Default.Image, null) },
+                        onClick = {
+                            showAttachmentMenu = false
+                            galleryLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("导入视频") },
+                        leadingIcon = { Icon(Icons.Default.VideoLibrary, null) },
+                        onClick = {
+                            showAttachmentMenu = false
+                            videoLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly))
+                        },
+                    )
                 }
             }
-            InputToolButton(icon = Icons.Default.Image, label = "相册", enabled = enabled) {
-                galleryLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-            }
-            InputToolButton(icon = Icons.Default.VideoLibrary, label = "视频", enabled = enabled) {
-                videoLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly))
-            }
-        }
-        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.Bottom) {
+            Spacer(Modifier.width(10.dp))
             Surface(
                 modifier = Modifier.weight(1f),
                 color = SurfaceMuted,
