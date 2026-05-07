@@ -799,6 +799,36 @@ private fun buildWorkOrderDocumentData(message: PocketMessage): WorkOrderDocumen
     )
 }
 
+private fun buildWorkOrderRecordText(
+    workOrderId: String,
+    createdAt: String,
+    workOrder: WorkOrderDocumentData,
+): String {
+    val details = StringBuilder()
+    details.appendLine("工单号：$workOrderId")
+    details.appendLine("创建时间：$createdAt")
+    details.appendLine("设备：${workOrder.equipment}")
+    workOrder.location.takeIf { it.isNotBlank() }?.let { details.appendLine("位置：$it") }
+    workOrder.symptom.takeIf { it.isNotBlank() }?.let { details.appendLine("故障现象：$it") }
+    workOrder.severity.takeIf { it.isNotBlank() }?.let { details.appendLine("严重程度：$it") }
+    details.appendLine("状态：${workOrder.status}")
+
+    fun appendSection(title: String, lines: List<String>) {
+        if (lines.isEmpty()) return
+        details.appendLine()
+        details.appendLine(title)
+        lines.forEach { details.appendLine("- $it") }
+    }
+
+    appendSection("故障摘要", listOf(workOrder.summary).filter { it.isNotBlank() })
+    appendSection("可能原因", workOrder.causes)
+    appendSection("维修步骤", workOrder.steps)
+    appendSection("所需备件", workOrder.parts)
+    appendSection("推荐人员", workOrder.personnel)
+    appendSection("相似工单参考", workOrder.relatedWorkOrders)
+    return details.toString().trim()
+}
+
 private fun wrapTextForPdf(text: String, paint: Paint, maxWidth: Float): List<String> {
     if (text.isBlank()) return listOf("暂无诊断数据")
 
@@ -2165,6 +2195,7 @@ fun PocketOpsApp(
             message = workOrderMessage,
             demoServerBaseUrl = demoServerBaseUrl,
             session = session,
+            onSaveRecord = { userText, aiText -> appendHistory(userText, aiText) },
             onDismiss = { selectedWorkOrderMessage = null },
         )
     }
@@ -2928,19 +2959,45 @@ private fun WorkOrderDialog(
     message: PocketMessage,
     demoServerBaseUrl: String,
     session: PocketOpsSession,
+    onSaveRecord: (String, String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val scrollState = rememberScrollState()
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.85f).dp
-    val workOrder = remember(message.text, message.report, message.relatedWorkOrders) {
+    val initialWorkOrder = remember(message.text, message.report, message.relatedWorkOrders) {
         buildWorkOrderDocumentData(message)
     }
+    var equipment by remember(initialWorkOrder) { mutableStateOf(initialWorkOrder.equipment) }
+    var location by remember(initialWorkOrder) { mutableStateOf(initialWorkOrder.location) }
+    var symptom by remember(initialWorkOrder) { mutableStateOf(initialWorkOrder.symptom) }
+    var severity by remember(initialWorkOrder) { mutableStateOf(initialWorkOrder.severity) }
+    var status by remember(initialWorkOrder) { mutableStateOf(initialWorkOrder.status) }
+    var summary by remember(initialWorkOrder) { mutableStateOf(initialWorkOrder.summary) }
+    val causes = remember(initialWorkOrder) { mutableStateListOf<String>().apply { addAll(initialWorkOrder.causes) } }
+    val parts = remember(initialWorkOrder) { mutableStateListOf<String>().apply { addAll(initialWorkOrder.parts) } }
+    val steps = remember(initialWorkOrder) { mutableStateListOf<String>().apply { addAll(initialWorkOrder.steps) } }
+    val personnel = remember(initialWorkOrder) { mutableStateListOf<String>().apply { addAll(initialWorkOrder.personnel) } }
+    val relatedWorkOrders = remember(initialWorkOrder) { mutableStateListOf<String>().apply { addAll(initialWorkOrder.relatedWorkOrders) } }
     val workOrderId = remember(message.text, message.report) { "\u5de5\u5355-${System.currentTimeMillis().toString().takeLast(8)}" }
     val createdAt = remember(message.text, message.report) {
         SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date())
     }
+    val editedWorkOrder =
+        WorkOrderDocumentData(
+            equipment = equipment.trim(),
+            location = location.trim(),
+            symptom = symptom.trim(),
+            severity = severity.trim(),
+            status = status.trim().ifBlank { "待处理" },
+            summary = summary.trim(),
+            causes = causes.map { it.trim() }.filter { it.isNotBlank() },
+            parts = parts.map { it.trim() }.filter { it.isNotBlank() },
+            steps = steps.map { it.trim() }.filter { it.isNotBlank() },
+            personnel = personnel.map { it.trim() }.filter { it.isNotBlank() },
+            relatedWorkOrders = relatedWorkOrders.map { it.trim() }.filter { it.isNotBlank() },
+        )
     val normalizedDemoServerBaseUrl = remember(demoServerBaseUrl) {
         normalizeDemoServerBaseUrl(demoServerBaseUrl)
     }
@@ -2948,6 +3005,18 @@ private fun WorkOrderDialog(
     var isLoadingMaterials by remember(message.text, demoServerBaseUrl) { mutableStateOf(false) }
     var materialsError by remember(message.text, demoServerBaseUrl) { mutableStateOf<String?>(null) }
     var downloadingMaterialId by remember(message.text, demoServerBaseUrl) { mutableStateOf<String?>(null) }
+    var lastSavedRecordText by remember(workOrderId) { mutableStateOf<String?>(null) }
+
+    fun saveEditedRecordIfChanged(): Boolean {
+        val recordText = buildWorkOrderRecordText(workOrderId, createdAt, editedWorkOrder)
+        if (lastSavedRecordText == recordText) return false
+        onSaveRecord(
+            "人工编辑工单：${editedWorkOrder.equipment.ifBlank { workOrderId }}",
+            recordText,
+        )
+        lastSavedRecordText = recordText
+        return true
+    }
 
     fun loadMaterials() {
         if (normalizedDemoServerBaseUrl.isBlank()) {
@@ -2988,38 +3057,34 @@ private fun WorkOrderDialog(
             ) {
                 Column {
                     Text("工单报告", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = TextMain)
-                    Text("现场执行单与资料下载面板", fontSize = 12.sp, color = TextMuted)
+                    Text("人工确认后再导出或保存记录", fontSize = 12.sp, color = TextMuted)
                 }
-                StatusChip(workOrder.status, AccentSoft, Accent)
+                StatusChip(editedWorkOrder.status, AccentSoft, Accent)
             }
             Spacer(Modifier.height(16.dp))
 
-            Card(
-                Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(18.dp),
-                border = BorderStroke(1.dp, BorderSoft),
-            ) {
-                Column(Modifier.padding(16.dp)) {
-                    Text("工单摘要", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = TextMain)
-                    Spacer(Modifier.height(10.dp))
-                    WoRow("工单号", workOrderId)
-                    WoRow("创建时间", createdAt)
-                    WoRow("设备", workOrder.equipment)
-                    if (workOrder.location.isNotBlank()) WoRow("位置", workOrder.location)
-                    if (workOrder.symptom.isNotBlank()) WoRow("故障现象", workOrder.symptom)
-                    if (workOrder.severity.isNotBlank()) WoRow("严重程度", workOrder.severity)
-                    WoRow("状态", workOrder.status)
-                }
-            }
+            EditableWorkOrderSummaryCard(
+                workOrderId = workOrderId,
+                createdAt = createdAt,
+                equipment = equipment,
+                onEquipmentChange = { equipment = it },
+                location = location,
+                onLocationChange = { location = it },
+                symptom = symptom,
+                onSymptomChange = { symptom = it },
+                severity = severity,
+                onSeverityChange = { severity = it },
+                status = status,
+                onStatusChange = { status = it },
+            )
             Spacer(Modifier.height(12.dp))
 
-            WorkOrderSectionCard(title = "故障摘要", lines = listOf(workOrder.summary))
-            WorkOrderSectionCard(title = "可能原因", lines = workOrder.causes)
-            WorkOrderSectionCard(title = "维修步骤", lines = workOrder.steps)
-            WorkOrderSectionCard(title = "所需备件", lines = workOrder.parts)
-            WorkOrderSectionCard(title = "推荐人员", lines = workOrder.personnel)
-            WorkOrderSectionCard(title = "相似工单参考", lines = workOrder.relatedWorkOrders)
+            EditableTextBlockCard(title = "故障摘要", value = summary, onValueChange = { summary = it })
+            EditableListCard(title = "可能原因", lines = causes, newItemLabel = "新增原因")
+            EditableListCard(title = "维修步骤", lines = steps, newItemLabel = "新增步骤")
+            EditableListCard(title = "所需备件", lines = parts, newItemLabel = "新增备件")
+            EditableListCard(title = "推荐人员", lines = personnel, newItemLabel = "新增人员")
+            EditableListCard(title = "相似工单参考", lines = relatedWorkOrders, newItemLabel = "新增参考")
 
             DemoMaterialsCard(
                 materials = remoteMaterials,
@@ -3060,15 +3125,33 @@ private fun WorkOrderDialog(
             }
             Spacer(Modifier.height(8.dp))
 
+            OutlinedButton(
+                onClick = {
+                    val saved = saveEditedRecordIfChanged()
+                    Toast.makeText(
+                        context,
+                        if (saved) "编辑后的工单已保存到诊断历史" else "当前工单内容已保存",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                },
+                modifier = Modifier.fillMaxWidth().height(44.dp),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, Accent.copy(alpha = 0.35f)),
+            ) {
+                Text("保存修改记录", color = Accent)
+            }
+            Spacer(Modifier.height(8.dp))
+
             Button(
                 onClick = {
                     if (exportWorkOrderPdf(
                             context = context,
                             workOrderId = workOrderId,
                             createdAt = createdAt,
-                            workOrder = workOrder,
+                            workOrder = editedWorkOrder,
                         )
                     ) {
+                        saveEditedRecordIfChanged()
                         onDismiss()
                     }
                 },
@@ -3094,6 +3177,162 @@ private fun WoRow(label: String, value: String) {
             modifier = Modifier.weight(1f),
         )
     }
+}
+
+@Composable
+private fun EditableWorkOrderSummaryCard(
+    workOrderId: String,
+    createdAt: String,
+    equipment: String,
+    onEquipmentChange: (String) -> Unit,
+    location: String,
+    onLocationChange: (String) -> Unit,
+    symptom: String,
+    onSymptomChange: (String) -> Unit,
+    severity: String,
+    onSeverityChange: (String) -> Unit,
+    status: String,
+    onStatusChange: (String) -> Unit,
+) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        shape = RoundedCornerShape(18.dp),
+        border = BorderStroke(1.dp, BorderSoft),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text("工单摘要", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = TextMain)
+            Spacer(Modifier.height(10.dp))
+            WoRow("工单号", workOrderId)
+            WoRow("创建时间", createdAt)
+            Spacer(Modifier.height(8.dp))
+            EditableWorkOrderField("设备", equipment, onEquipmentChange)
+            EditableWorkOrderField("位置", location, onLocationChange)
+            EditableWorkOrderField("故障现象", symptom, onSymptomChange)
+            EditableWorkOrderField("严重程度", severity, onSeverityChange)
+            EditableWorkOrderField("状态", status, onStatusChange)
+        }
+    }
+}
+
+@Composable
+private fun EditableWorkOrderField(
+    label: String,
+    value: String,
+    onValueChange: (String) -> Unit,
+    minLines: Int = 1,
+) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
+        Text(label, fontSize = 12.sp, color = TextMuted, fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(4.dp))
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            modifier = Modifier.fillMaxWidth(),
+            minLines = minLines,
+            maxLines = if (minLines > 1) 5 else 1,
+            singleLine = minLines == 1,
+            textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = TextMain),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Accent,
+                unfocusedBorderColor = BorderSoft,
+                focusedContainerColor = Color.White,
+                unfocusedContainerColor = Color.White,
+            ),
+            shape = RoundedCornerShape(12.dp),
+        )
+    }
+}
+
+@Composable
+private fun EditableTextBlockCard(
+    title: String,
+    value: String,
+    onValueChange: (String) -> Unit,
+) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        elevation = CardDefaults.cardElevation(1.dp),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, BorderSoft),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TextMain)
+            Spacer(Modifier.height(8.dp))
+            EditableWorkOrderField("内容", value, onValueChange, minLines = 3)
+        }
+    }
+    Spacer(Modifier.height(12.dp))
+}
+
+@Composable
+private fun EditableListCard(
+    title: String,
+    lines: MutableList<String>,
+    newItemLabel: String,
+) {
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        elevation = CardDefaults.cardElevation(1.dp),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, BorderSoft),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TextMain)
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = { lines.add("") }) {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(newItemLabel, fontSize = 12.sp)
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            if (lines.isEmpty()) {
+                Surface(color = SurfaceMuted, shape = RoundedCornerShape(12.dp)) {
+                    Text(
+                        "暂无内容，可点击右上角新增。",
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                        fontSize = 12.sp,
+                        color = TextMuted,
+                    )
+                }
+            } else {
+                lines.forEachIndexed { index, line ->
+                    Row(
+                        Modifier.fillMaxWidth().padding(vertical = 5.dp),
+                        verticalAlignment = Alignment.Top,
+                    ) {
+                        OutlinedTextField(
+                            value = line,
+                            onValueChange = { lines[index] = it },
+                            modifier = Modifier.weight(1f),
+                            minLines = 1,
+                            maxLines = 4,
+                            textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = TextMain),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Accent,
+                                unfocusedBorderColor = BorderSoft,
+                                focusedContainerColor = Color.White,
+                                unfocusedContainerColor = Color.White,
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        IconButton(
+                            onClick = { lines.removeAt(index) },
+                            modifier = Modifier.size(40.dp),
+                        ) {
+                            Icon(Icons.Default.Delete, contentDescription = "删除", tint = DangerColor)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Spacer(Modifier.height(12.dp))
 }
 
 @Composable
