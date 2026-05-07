@@ -1,6 +1,6 @@
 {
   "nodes": [
-    {"id":"eq_001","type":"EQUIPMENT","label":"3号叉车","properties":{"brand":"合力","model":"CPCD30","year":"2021","location":"A区仓库"}},
+    {"id":"eq_001","type":"EQUIPMENT","label":"3号叉车","properties":{"brand":"合力","model":"CPCD30","year":"2021","location":"A区仓库","配置号":"35-Q19K"}},
     {"id":"eq_002","type":"EQUIPMENT","label":"5号叉车","properties":{"brand":"杭叉","model":"R30","year":"2022","location":"B区车间"}},
     {"id":"eq_003","type":"EQUIPMENT","label":"7号叉车","properties":{"brand":"讯众","model":"XZ-30","year":"2020","location":"C区矿山"}},
     {"id":"eq_004","type":"EQUIPMENT","label":"2号叉车","properties":{"brand":"合力","model":"CPCD25","year":"2023","location":"A区仓库"}},

@@ -13,13 +13,15 @@ directory so the phone can demonstrate a true remote bootstrap sync.
 from __future__ import annotations
 
 import argparse
+import hmac
 import hashlib
 import io
 import json
+import secrets
 import socket
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,6 +36,9 @@ KNOWLEDGE_GRAPH_RELATIVE_PATH = Path(
 )
 DEFAULT_SYNC_VERSION = "2026-05-06.demo.1"
 DEFAULT_MIN_SUPPORTED_APP_VERSION = "1.0.0"
+DEFAULT_DEMO_USERNAME = "engineer"
+DEFAULT_DEMO_PASSWORD = "PocketOps@2026"
+DEFAULT_TOKEN_TTL_SECONDS = 8 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,7 @@ class FileAsset:
 
 ASSETS: Dict[str, FileAsset] = {}
 GRAPH_STATS: Dict[str, object] = {}
+AUTH_SESSIONS: Dict[str, Dict[str, object]] = {}
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -414,6 +420,40 @@ def build_materials(base_url: str, payload: Dict[str, object]) -> Dict[str, obje
     }
 
 
+def authenticate_demo_user(
+    username: str,
+    password: str,
+    expected_username: str,
+    expected_password: str,
+) -> bool:
+    return hmac.compare_digest(username, expected_username) and hmac.compare_digest(password, expected_password)
+
+
+def create_auth_session(username: str) -> Dict[str, object]:
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=DEFAULT_TOKEN_TTL_SECONDS)
+    session = {
+        "accessToken": token,
+        "userId": username,
+        "displayName": "维修工程师",
+        "role": "maintenance_engineer",
+        "expiresInSeconds": DEFAULT_TOKEN_TTL_SECONDS,
+        "expiresAt": expires_at,
+    }
+    AUTH_SESSIONS[token] = session
+    return session
+
+
+def public_auth_session(session: Dict[str, object]) -> Dict[str, object]:
+    return {
+        "accessToken": session["accessToken"],
+        "userId": session["userId"],
+        "displayName": session["displayName"],
+        "role": session["role"],
+        "expiresInSeconds": session["expiresInSeconds"],
+    }
+
+
 def parse_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, object]:
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length) if length > 0 else b"{}"
@@ -457,8 +497,16 @@ class PocketOpsDemoHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+
+        if parsed.path == "/api/pocketops/auth/login":
+            self.handle_login()
+            return
+
         if parsed.path != "/api/pocketops/materials/query":
             self.send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
+            return
+
+        if not self.require_auth():
             return
 
         try:
@@ -469,9 +517,31 @@ class PocketOpsDemoHandler(BaseHTTPRequestHandler):
 
         self.send_json(build_materials(self.base_url(), payload))
 
+    def handle_login(self) -> None:
+        try:
+            payload = parse_json_body(self)
+        except json.JSONDecodeError as exc:
+            self.send_json({"error": f"invalid_json: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        username = str(payload.get("username") or "")
+        password = str(payload.get("password") or "")
+        if not authenticate_demo_user(
+            username=username,
+            password=password,
+            expected_username=getattr(self.server, "demo_username", DEFAULT_DEMO_USERNAME),
+            expected_password=getattr(self.server, "demo_password", DEFAULT_DEMO_PASSWORD),
+        ):
+            self.send_json({"error": "invalid_credentials"}, status=HTTPStatus.UNAUTHORIZED)
+            return
+
+        self.send_json(public_auth_session(create_auth_session(username)))
+
     def handle_request(self, with_body: bool) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/pocketops/bootstrap/manifest":
+            if not self.require_auth(with_body=with_body):
+                return
             self.send_json(
                 build_manifest(
                     self.base_url(),
@@ -491,7 +561,30 @@ class PocketOpsDemoHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND, with_body=with_body)
             return
 
+        if not self.require_auth(with_body=with_body):
+            return
+
         self.send_asset(asset, with_body=with_body)
+
+    def require_auth(self, with_body: bool = True) -> bool:
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            self.send_json({"error": "missing_bearer_token"}, status=HTTPStatus.UNAUTHORIZED, with_body=with_body)
+            return False
+
+        token = header.removeprefix("Bearer ").strip()
+        session = AUTH_SESSIONS.get(token)
+        if session is None:
+            self.send_json({"error": "invalid_bearer_token"}, status=HTTPStatus.UNAUTHORIZED, with_body=with_body)
+            return False
+
+        expires_at = session.get("expiresAt")
+        if not isinstance(expires_at, datetime) or expires_at <= datetime.now(timezone.utc):
+            AUTH_SESSIONS.pop(token, None)
+            self.send_json({"error": "expired_bearer_token"}, status=HTTPStatus.UNAUTHORIZED, with_body=with_body)
+            return False
+
+        return True
 
     def base_url(self) -> str:
         host = self.headers.get("Host")
@@ -582,6 +675,16 @@ def main() -> None:
         default=DEFAULT_MIN_SUPPORTED_APP_VERSION,
         help=f"Manifest minSupportedAppVersion, default: {DEFAULT_MIN_SUPPORTED_APP_VERSION}",
     )
+    parser.add_argument(
+        "--demo-username",
+        default=DEFAULT_DEMO_USERNAME,
+        help=f"Demo login username, default: {DEFAULT_DEMO_USERNAME}",
+    )
+    parser.add_argument(
+        "--demo-password",
+        default=DEFAULT_DEMO_PASSWORD,
+        help="Demo login password.",
+    )
     args = parser.parse_args()
 
     knowledge_graph_path = resolve_knowledge_graph_path(args.knowledge_graph)
@@ -590,10 +693,14 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), PocketOpsDemoHandler)
     server.sync_version = args.sync_version
     server.min_supported_app_version = args.min_supported_app_version
+    server.demo_username = args.demo_username
+    server.demo_password = args.demo_password
     print("PocketOps demo mock server is running.")
     print(f"Knowledge graph source: {knowledge_graph_path}")
     print(f"Manifest syncVersion: {args.sync_version}")
     print(f"Manifest minSupportedAppVersion: {args.min_supported_app_version}")
+    print(f"Demo login username: {args.demo_username}")
+    print(f"Demo login password: {args.demo_password}")
     print("Use one of these URLs in the Android demo:")
     for url in dict.fromkeys(iter_candidate_urls(args.host, args.port)):
         print(f"  {url}")

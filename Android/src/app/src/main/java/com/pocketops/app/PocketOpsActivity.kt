@@ -33,6 +33,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
@@ -64,18 +65,23 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.core.content.FileProvider
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import com.google.ai.edge.gallery.customtasks.maintenance.DiagnosticReport
+import com.google.ai.edge.gallery.customtasks.maintenance.GraphEdge
 import com.google.ai.edge.gallery.customtasks.maintenance.GraphNode
 import com.google.ai.edge.gallery.customtasks.maintenance.MaintenanceKnowledgeGraph
 import com.google.ai.edge.gallery.customtasks.maintenance.NodeType
+import com.google.ai.edge.gallery.customtasks.maintenance.SubGraph
 import com.google.ai.edge.gallery.ui.common.MarkdownText
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.Dispatchers
@@ -979,11 +985,16 @@ class PocketOpsActivity : ComponentActivity() {
 fun LoginScreen(
     demoServerBaseUrl: String,
     onConfigureServer: () -> Unit,
-    onLogin: () -> Unit,
+    onLogin: (PocketOpsSession) -> Unit,
 ) {
-    var username by remember { mutableStateOf("\u7ef4\u4fee\u5de5\u7a0b\u5e08") }
-    var password by remember { mutableStateOf("123456") }
+    val context = LocalContext.current
+    val savedCredentials = remember { loadSavedLoginCredentials(context) }
+    var username by remember { mutableStateOf(savedCredentials.username) }
+    var password by remember { mutableStateOf(savedCredentials.password) }
+    var rememberPassword by remember { mutableStateOf(savedCredentials.rememberPassword) }
+    var passwordVisible by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
+    var loginError by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val fieldColors = TextFieldDefaults.colors(
         focusedContainerColor = Color.White.copy(alpha = 0.07f),
@@ -1067,7 +1078,7 @@ fun LoginScreen(
                 Column(Modifier.padding(24.dp)) {
                     Text("登录入口", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Spacer(Modifier.height(4.dp))
-                    Text("工号认证后进入工业车辆诊断工作台", fontSize = 12.sp, color = Color.White.copy(alpha = 0.6f))
+                    Text("优先连接电脑服务认证；不可用时自动使用离线凭据", fontSize = 12.sp, color = Color.White.copy(alpha = 0.6f))
                     Spacer(Modifier.height(22.dp))
 
                     Text("工号 / 账号", fontSize = 12.sp, color = Color.White.copy(alpha = 0.58f), fontWeight = FontWeight.Medium)
@@ -1091,14 +1102,52 @@ fun LoginScreen(
                         colors = fieldColors,
                         shape = RoundedCornerShape(12.dp),
                         singleLine = true,
-                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                        visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                        trailingIcon = {
+                            IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                                Icon(
+                                    if (passwordVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                    contentDescription = if (passwordVisible) "隐藏密码" else "显示密码",
+                                    tint = Color.White.copy(alpha = 0.72f),
+                                )
+                            }
+                        },
                     )
-                    Spacer(Modifier.height(22.dp))
+                    Spacer(Modifier.height(10.dp))
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = rememberPassword,
+                            onCheckedChange = { rememberPassword = it },
+                            colors = CheckboxDefaults.colors(
+                                checkedColor = Accent,
+                                uncheckedColor = Color.White.copy(alpha = 0.65f),
+                                checkmarkColor = Color.White,
+                            ),
+                        )
+                        Text("记住密码", fontSize = 12.sp, color = Color.White.copy(alpha = 0.72f))
+                    }
+                    Spacer(Modifier.height(12.dp))
 
                     Button(
                         onClick = {
                             isLoading = true
-                            scope.launch { kotlinx.coroutines.delay(800); onLogin() }
+                            loginError = null
+                            scope.launch {
+                                try {
+                                    val session = authenticatePocketOpsUser(
+                                        baseUrl = demoServerBaseUrl,
+                                        username = username,
+                                        password = password,
+                                    )
+                                    saveLoginCredentials(context, username, password, rememberPassword)
+                                    onLogin(session)
+                                } catch (e: Exception) {
+                                    loginError = e.message ?: "登录失败"
+                                } finally {
+                                    isLoading = false
+                                }
+                            }
                         },
                         modifier = Modifier.fillMaxWidth().height(52.dp),
                         enabled = !isLoading && username.isNotBlank() && password.isNotBlank(),
@@ -1110,6 +1159,14 @@ fun LoginScreen(
                         } else {
                             Text("进入工作台", fontSize = 15.sp, fontWeight = FontWeight.Bold)
                         }
+                    }
+                    if (demoServerBaseUrl.isBlank()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text("未配置电脑服务，将直接使用离线凭据和本地知识库。", fontSize = 12.sp, color = GraphAccent)
+                    }
+                    loginError?.let { error ->
+                        Spacer(Modifier.height(8.dp))
+                        Text(error, fontSize = 12.sp, color = WarningColor)
                     }
                     Spacer(Modifier.height(14.dp))
                     TextButton(
@@ -1155,18 +1212,20 @@ fun LoginScreen(
 @Composable
 fun PocketOpsRoot() {
     val context = LocalContext.current
-    var loggedIn by remember { mutableStateOf(false) }
+    var session by remember { mutableStateOf<PocketOpsSession?>(null) }
     var demoServerBaseUrl by remember { mutableStateOf(loadDemoServerBaseUrl(context)) }
     var showServerConfigDialog by remember { mutableStateOf(false) }
-    if (!loggedIn) {
+    val activeSession = session
+    if (activeSession == null) {
         LoginScreen(
             demoServerBaseUrl = demoServerBaseUrl,
             onConfigureServer = { showServerConfigDialog = true },
-            onLogin = { loggedIn = true },
+            onLogin = { session = it },
         )
     } else {
         PocketOpsApp(
             demoServerBaseUrl = demoServerBaseUrl,
+            session = activeSession,
             onConfigureServer = { showServerConfigDialog = true },
         )
     }
@@ -1187,6 +1246,7 @@ fun PocketOpsRoot() {
 @Composable
 fun PocketOpsApp(
     demoServerBaseUrl: String,
+    session: PocketOpsSession,
     onConfigureServer: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -1200,6 +1260,7 @@ fun PocketOpsApp(
     val messages = remember { mutableStateListOf<PocketMessage>() }
     val knowledgeGraph = remember { MaintenanceKnowledgeGraph() }
     val conversationHistory = remember { mutableStateListOf<Pair<String, String>>() }
+    var activeEquipmentContext by remember { mutableStateOf<GraphNode?>(null) }
     val listState = rememberLazyListState()
     var showBluetoothDialog by remember { mutableStateOf(false) }
     var selectedWorkOrderMessage by remember { mutableStateOf<PocketMessage?>(null) }
@@ -1368,7 +1429,7 @@ fun PocketOpsApp(
                     }
 
                     try {
-                        val manifest = fetchDemoManifest(normalizedDemoServerBaseUrl)
+                        val manifest = fetchDemoManifest(normalizedDemoServerBaseUrl, session.accessToken)
                         val manifestSummary = manifest.summary.toStatusLine()
                         val graphResource =
                             manifest.resources.firstOrNull { it.id == "knowledge_graph" }
@@ -1392,7 +1453,7 @@ fun PocketOpsApp(
                             loadingText = "\u6b63\u5728\u4e0b\u8f7d\u8fdc\u7a0b\u77e5\u8bc6\u8d44\u6e90..."
                         }
 
-                        val syncedGraphFile = syncDemoResource(context, graphResource)
+                        val syncedGraphFile = syncDemoResource(context, graphResource, session.accessToken)
                         val kgJson = syncedGraphFile.readText()
                         knowledgeGraph.loadFromJson(kgJson)
 
@@ -1602,6 +1663,7 @@ fun PocketOpsApp(
 
         messages.add(PocketMessage(text = userMessageText, isUser = true, bitmap = safeBitmap))
         val userMessageIndex = messages.lastIndex
+        val equipmentContextForTurn = activeEquipmentContext
         isGenerating = true
 
         scope.launch(Dispatchers.IO) {
@@ -1685,6 +1747,9 @@ fun PocketOpsApp(
                         withContext(Dispatchers.Main) {
                             val idx = messages.size - 1
                             if (idx >= 0) messages[idx] = messages[idx].copy(text = content)
+                            knowledgeGraph.findEquipment(content).firstOrNull()?.let { matchedEquipment ->
+                                activeEquipmentContext = matchedEquipment
+                            }
                         }
                         conversationHistory.add("user" to visualHistoryLabel)
                         conversationHistory.add("assistant" to content)
@@ -1700,13 +1765,22 @@ fun PocketOpsApp(
                     return@launch
                 }
 
-                // Check GraphRAG first
+                // Check GraphRAG first. Try the current turn first, then include recent
+                // conversation so image-recognized identifiers can be used in follow-ups.
+                val retrievalText = buildConversationRetrievalText(userText, conversationHistory)
+                val contextualRetrievalText = buildEquipmentContextRetrievalText(userText, retrievalText, equipmentContextForTurn)
                 Log.d(TAG, "GraphRAG check: '${userText}', nodes=${knowledgeGraph.getNodeCount()}")
-                val graphResult = buildGraphRAGReport(userText, knowledgeGraph)
+                val graphResult =
+                    buildGraphRAGReport(userText, knowledgeGraph)
+                        ?: buildGraphRAGReport(contextualRetrievalText, knowledgeGraph, equipmentContextForTurn)
+                        ?: buildGraphRAGReport(retrievalText, knowledgeGraph)
                 if (graphResult != null) {
                     val (report, graphJson) = graphResult
                     Log.d(TAG, "GraphRAG hit: ${report.equipment}")
-                    withContext(Dispatchers.Main) { messages.add(PocketMessage(text = "", isUser = false, report = report, graphJson = graphJson)) }
+                    withContext(Dispatchers.Main) {
+                        messages.add(PocketMessage(text = "", isUser = false, report = report, graphJson = graphJson))
+                        activeEquipmentContext = report.equipment
+                    }
                     conversationHistory.add("user" to userText)
                     conversationHistory.add("assistant" to buildDiagnosticReportText(report))
                     appendHistory(userText, buildDiagnosticReportText(report), isGraphRAG = true)
@@ -1715,14 +1789,35 @@ fun PocketOpsApp(
                     Log.d(TAG, "GraphRAG miss")
                 }
 
+                val equipmentLookupResult = buildEquipmentLookupAnswer(userText, contextualRetrievalText, knowledgeGraph)
+                if (equipmentLookupResult != null) {
+                    val (matchedEquipment, equipmentLookupAnswer) = equipmentLookupResult
+                    withContext(Dispatchers.Main) {
+                        messages.add(PocketMessage(text = equipmentLookupAnswer, isUser = false))
+                        activeEquipmentContext = matchedEquipment
+                    }
+                    conversationHistory.add("user" to userText)
+                    conversationHistory.add("assistant" to equipmentLookupAnswer)
+                    appendHistory(userText, equipmentLookupAnswer)
+                    return@launch
+                }
+
                 // LLM query via HTTP (stream)
                 withContext(Dispatchers.Main) { messages.add(PocketMessage(text = "", isUser = false)) }
 
-                val ragContext = buildPartialRAGContext(userText, knowledgeGraph)
+                val ragContext =
+                    buildPartialRAGContext(userText, knowledgeGraph)
+                        ?: buildPartialRAGContext(contextualRetrievalText, knowledgeGraph)
+                        ?: buildPartialRAGContext(retrievalText, knowledgeGraph)
                 val sysPrompt = if (ragContext != null) SYSTEM_PROMPT + "\n\n" + ragContext else SYSTEM_PROMPT
 
                 val httpMessages = org.json.JSONArray().apply {
                     put(org.json.JSONObject().put("role", "system").put("content", "你是工业叉车诊断助手，请用JSON格式回答。"))
+                    conversationHistory.takeLast(8).forEach { (role, content) ->
+                        if ((role == "user" || role == "assistant") && content.isNotBlank()) {
+                            put(org.json.JSONObject().put("role", role).put("content", content.take(1200)))
+                        }
+                    }
                     put(org.json.JSONObject().put("role", "user").put("content", "$sysPrompt\n\n$userText"))
                 }
 
@@ -1786,7 +1881,7 @@ fun PocketOpsApp(
                 val t1 = System.currentTimeMillis()
                 Log.d(TAG, "LLM done: ${t1 - t0}ms, len=${llmContent.length}, preview=${llmContent.take(200)}")
 
-                val relatedWOs = findRelatedWorkOrders(userText, knowledgeGraph)
+                val relatedWOs = findRelatedWorkOrders(contextualRetrievalText, knowledgeGraph)
                 withContext(Dispatchers.Main) {
                     val idx = messages.size - 1
                     if (idx >= 0) messages[idx] = messages[idx].copy(text = llmContent, relatedWorkOrders = relatedWOs)
@@ -1846,6 +1941,7 @@ fun PocketOpsApp(
                     ToolbarAction(icon = Icons.Default.Refresh, contentDescription = "新会话") {
                         messages.clear()
                         conversationHistory.clear()
+                        activeEquipmentContext = null
                         selectedWorkOrderMessage = null
                     }
                 },
@@ -2068,6 +2164,7 @@ fun PocketOpsApp(
         WorkOrderDialog(
             message = workOrderMessage,
             demoServerBaseUrl = demoServerBaseUrl,
+            session = session,
             onDismiss = { selectedWorkOrderMessage = null },
         )
     }
@@ -2092,6 +2189,7 @@ fun PocketOpsApp(
                 messages.add(PocketMessage(text = entry.aiText, isUser = false))
                 conversationHistory.add("user" to entry.userText)
                 conversationHistory.add("assistant" to entry.aiText)
+                activeEquipmentContext = knowledgeGraph.findEquipment("${entry.userText}\n${entry.aiText}").firstOrNull() ?: activeEquipmentContext
             },
         )
     }
@@ -2829,6 +2927,7 @@ private fun BluetoothDiagnosticDialog(onDismiss: () -> Unit, onConfirm: (String)
 private fun WorkOrderDialog(
     message: PocketMessage,
     demoServerBaseUrl: String,
+    session: PocketOpsSession,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -2862,7 +2961,7 @@ private fun WorkOrderDialog(
             materialsError = null
             try {
                 remoteMaterials = withContext(Dispatchers.IO) {
-                    queryDemoMaterials(normalizedDemoServerBaseUrl, message)
+                    queryDemoMaterials(normalizedDemoServerBaseUrl, message, session.accessToken)
                 }
             } catch (e: Exception) {
                 remoteMaterials = emptyList()
@@ -2933,7 +3032,7 @@ private fun WorkOrderDialog(
                         downloadingMaterialId = material.id
                         try {
                             val file = withContext(Dispatchers.IO) {
-                                downloadDemoMaterial(context, material)
+                                downloadDemoMaterial(context, material, session.accessToken)
                             }
                             val opened = openDemoMaterial(context, file, material.mimeType)
                             if (!opened) {
@@ -3174,7 +3273,13 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
     )
     val graphTypeOrder = listOf("EQUIPMENT", "ROOT_CAUSE", "PART", "REPAIR_STEP", "PERSONNEL", "WORK_ORDER", "FAULT_SYMPTOM")
 
-    fun buildNodePositions(nodes: List<GNode>, centerNodeId: String, widthPx: Float, heightPx: Float): Map<String, Offset> {
+    fun buildNodePositions(
+        nodes: List<GNode>,
+        centerNodeId: String,
+        widthPx: Float,
+        heightPx: Float,
+        edgeMarginPx: Float,
+    ): Map<String, Offset> {
         if (nodes.isEmpty()) return emptyMap()
 
         val centerNode = nodes.find { it.id == centerNodeId } ?: nodes.first()
@@ -3186,23 +3291,63 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
                     }.thenBy { it.label },
                 )
 
-        val center = Offset(widthPx / 2f, heightPx * 0.42f)
+        val center = Offset(widthPx / 2f, heightPx * 0.50f)
         val positions = mutableMapOf(centerNode.id to center)
         if (otherNodes.isEmpty()) return positions
 
-        val innerRadius = min(widthPx, heightPx) * 0.27f
-        val outerRadius = min(widthPx, heightPx) * 0.36f
+        val graphSpan = min(widthPx * 0.96f, heightPx * 0.84f)
+        val useTwoRings = otherNodes.size > 8
+        val innerRingCount = if (useTwoRings) min(6, otherNodes.size) else otherNodes.size
+        val outerRingCount = (otherNodes.size - innerRingCount).coerceAtLeast(1)
+        val singleRingRadius = graphSpan * 0.46f
+        val innerRadius = graphSpan * 0.34f
+        val outerRadius = graphSpan * 0.51f
         otherNodes.forEachIndexed { index, node ->
-            val angle = (-PI / 2.0) + (2.0 * PI * index / otherNodes.size.toDouble())
-            val radius = if (index % 2 == 0) innerRadius else outerRadius
+            val isOuterRing = useTwoRings && index >= innerRingCount
+            val ringIndex = if (isOuterRing) index - innerRingCount else index
+            val ringCount = if (isOuterRing) outerRingCount else innerRingCount
+            val angleOffset = if (isOuterRing) (-PI / 2.0) + (PI / outerRingCount.toDouble()) else (-PI / 2.0)
+            val angle = angleOffset + (2.0 * PI * ringIndex / ringCount.toDouble())
+            val radius =
+                when {
+                    !useTwoRings -> singleRingRadius
+                    isOuterRing -> outerRadius
+                    else -> innerRadius
+                }
             val x = center.x + cos(angle).toFloat() * radius
             val y = center.y + sin(angle).toFloat() * radius
             positions[node.id] = Offset(
-                x.coerceIn(52f, widthPx - 52f),
-                y.coerceIn(56f, heightPx - 88f),
+                x.coerceIn(edgeMarginPx, widthPx - edgeMarginPx),
+                y.coerceIn(edgeMarginPx, heightPx - edgeMarginPx),
             )
         }
         return positions
+    }
+
+    fun findNearestNode(
+        tap: Offset,
+        positions: Map<String, Offset>,
+        scale: Float,
+        offset: Offset,
+        widthPx: Float,
+        heightPx: Float,
+        hitRadiusPx: Float,
+    ): String? {
+        val pivot = Offset(widthPx / 2f, heightPx / 2f)
+        val graphTap =
+            Offset(
+                x = pivot.x + ((tap.x - offset.x - pivot.x) / scale),
+                y = pivot.y + ((tap.y - offset.y - pivot.y) / scale),
+            )
+        return positions
+            .map { (id, nodeOffset) ->
+                val dx = nodeOffset.x - graphTap.x
+                val dy = nodeOffset.y - graphTap.y
+                id to (dx * dx + dy * dy)
+            }
+            .filter { (_, distanceSquared) -> distanceSquared <= hitRadiusPx * hitRadiusPx }
+            .minByOrNull { (_, distanceSquared) -> distanceSquared }
+            ?.first
     }
 
     fun clampGraphOffset(offset: Offset, scale: Float, widthPx: Float, heightPx: Float): Offset {
@@ -3239,7 +3384,8 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
                 var graphScale by remember(graphJson) { mutableFloatStateOf(1f) }
                 var graphOffset by remember(graphJson) { mutableStateOf(Offset.Zero) }
                 val selectedNode = nodesById[selectedNodeId] ?: centerNode
-                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp)) {
+                val detailScrollState = rememberScrollState()
+                Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 4.dp)) {
                     centerNode?.let { cn ->
                         Card(Modifier.fillMaxWidth().padding(vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = typeColors[cn.type] ?: Accent), shape = RoundedCornerShape(16.dp)) {
                             Column(Modifier.padding(14.dp)) {
@@ -3253,7 +3399,7 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
                     BoxWithConstraints(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(360.dp)
+                            .weight(0.56f)
                             .clip(RoundedCornerShape(20.dp))
                             .background(GraphCard),
                     ) {
@@ -3261,11 +3407,13 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
                             val density = LocalDensity.current
                             val widthPx = with(density) { maxWidth.toPx() }
                             val heightPx = with(density) { maxHeight.toPx() }
-                            val positions = remember(nodes, centerNode.id, widthPx, heightPx) {
-                                buildNodePositions(nodes, centerNode.id, widthPx, heightPx)
+                            val edgeMarginPx = with(density) { 68.dp.toPx() }
+                            val positions = remember(nodes, centerNode.id, widthPx, heightPx, edgeMarginPx) {
+                                buildNodePositions(nodes, centerNode.id, widthPx, heightPx, edgeMarginPx)
                             }
-                            val normalNodeWidth = 88.dp
-                            val centerNodeWidth = 96.dp
+                            val normalNodeWidth = 116.dp
+                            val centerNodeWidth = 128.dp
+                            val nodeHitRadiusPx = with(density) { 24.dp.toPx() }
 
                             Box(
                                 modifier =
@@ -3289,6 +3437,19 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
                                                         heightPx = heightPx,
                                                     )
                                             }
+                                        }
+                                        .pointerInput(graphJson, positions, graphScale, graphOffset) {
+                                            detectTapGestures { tap ->
+                                                findNearestNode(
+                                                    tap = tap,
+                                                    positions = positions,
+                                                    scale = graphScale,
+                                                    offset = graphOffset,
+                                                    widthPx = widthPx,
+                                                    heightPx = heightPx,
+                                                    hitRadiusPx = nodeHitRadiusPx,
+                                                )?.let { selectedNodeId = it }
+                                            }
                                         },
                             ) {
                                 Box(
@@ -3306,7 +3467,7 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
                                         positions[centerNode.id]?.let { center ->
                                             drawCircle(
                                                 color = GraphAccent.copy(alpha = 0.10f),
-                                                radius = min(size.width, size.height) * 0.24f,
+                                                radius = min(size.width, size.height) * 0.30f,
                                                 center = center,
                                             )
                                         }
@@ -3338,25 +3499,27 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
                                         val isSelected = node.id == selectedNodeId
                                         val color = if (isCenterNode) GraphAccent else (typeColors[node.type] ?: GraphAccent)
                                         val nodeWidth = if (isCenterNode) centerNodeWidth else normalNodeWidth
-                                        val nodeSize = if (isCenterNode) 40.dp else 30.dp
+                                        val nodeSize = if (isCenterNode) 48.dp else 38.dp
                                         val nodeWidthPx = with(density) { nodeWidth.toPx() }
-                                        val nodeSizePx = with(density) { nodeSize.toPx() }
+                                        val hitSize = 88.dp
+                                        val hitSizePx = with(density) { hitSize.toPx() }
 
                                         Column(
                                             modifier =
                                                 Modifier
-                                                    .width(nodeWidth)
+                                                    .size(width = nodeWidth, height = 88.dp)
                                                     .offset {
                                                         IntOffset(
                                                             (pos.x - nodeWidthPx / 2f).roundToInt(),
-                                                            (pos.y - nodeSizePx / 2f).roundToInt(),
+                                                            (pos.y - hitSizePx / 2f).roundToInt(),
                                                         )
                                                     }
-                                                    .clickable { selectedNodeId = node.id },
+                                                    .zIndex(if (isSelected) 2f else if (isCenterNode) 1f else 0f),
                                             horizontalAlignment = Alignment.CenterHorizontally,
+                                            verticalArrangement = Arrangement.Center,
                                         ) {
                                             Surface(
-                                                modifier = Modifier.size(nodeSize),
+                                                modifier = Modifier.size(nodeSize).clickable { selectedNodeId = node.id },
                                                 color = GraphCard,
                                                 shape = CircleShape,
                                                 border = BorderStroke(if (isSelected) 2.dp else 1.dp, if (isSelected) color else color.copy(alpha = 0.55f)),
@@ -3372,10 +3535,10 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
                                             Spacer(Modifier.height(5.dp))
                                             Text(
                                                 node.label,
-                                                fontSize = if (isCenterNode) 11.sp else 10.sp,
+                                                fontSize = if (isCenterNode) 12.sp else 11.sp,
                                                 color = Color.White.copy(alpha = if (isSelected) 0.96f else 0.74f),
                                                 textAlign = TextAlign.Center,
-                                                lineHeight = 12.sp,
+                                                lineHeight = 13.sp,
                                                 maxLines = 2,
                                             )
                                         }
@@ -3424,113 +3587,135 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
                     }
 
                     Spacer(Modifier.height(12.dp))
-                    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.Center) {
-                        typeColors.forEach { (type, color) ->
-                            Row(Modifier.padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Box(Modifier.size(8.dp).background(color, CircleShape)); Spacer(Modifier.width(4.dp))
-                                Text(typeLabels[type] ?: type, fontSize = 10.sp, color = Color.White.copy(0.6f))
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .weight(0.44f)
+                            .verticalScroll(detailScrollState),
+                    ) {
+                        Card(
+                            Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = GraphCard),
+                            shape = RoundedCornerShape(16.dp),
+                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.06f)),
+                        ) {
+                            Column(Modifier.padding(14.dp)) {
+                                Text("图例", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                Spacer(Modifier.height(10.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                ) {
+                                    typeColors.forEach { (type, color) ->
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Box(Modifier.size(8.dp).background(color, CircleShape))
+                                            Spacer(Modifier.width(6.dp))
+                                            Text(typeLabels[type] ?: type, fontSize = 11.sp, color = Color.White.copy(0.7f))
+                                        }
+                                    }
+                                }
                             }
                         }
-                    }
 
-                    selectedNode?.let { node ->
-                        val relatedEdges = edges.filter { it.source == node.id || it.target == node.id }
-                        val nodeColor = if (node.id == centerNode?.id) GraphAccent else (typeColors[node.type] ?: GraphAccent)
+                        selectedNode?.let { node ->
+                            val relatedEdges = edges.filter { it.source == node.id || it.target == node.id }
+                            val nodeColor = if (node.id == centerNode?.id) GraphAccent else (typeColors[node.type] ?: GraphAccent)
+                            Card(
+                                Modifier.fillMaxWidth().padding(top = 12.dp),
+                                colors = CardDefaults.cardColors(containerColor = GraphCard),
+                                shape = RoundedCornerShape(16.dp),
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.06f)),
+                            ) {
+                                Column(Modifier.padding(14.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Box(Modifier.size(10.dp).background(nodeColor, CircleShape))
+                                        Spacer(Modifier.width(8.dp))
+                                        Column(Modifier.weight(1f)) {
+                                            Text(node.label, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                            Text("${typeLabels[node.type] ?: node.type} · ${node.id}", fontSize = 11.sp, color = Color.White.copy(alpha = 0.56f))
+                                        }
+                                        StatusChip("${relatedEdges.size} 条关联边", nodeColor.copy(alpha = 0.16f), nodeColor)
+                                    }
+                                    Spacer(Modifier.height(12.dp))
+                                    if (relatedEdges.isEmpty()) {
+                                        Text("当前节点暂无关联边。", fontSize = 12.sp, color = Color.White.copy(alpha = 0.55f))
+                                    } else {
+                                        relatedEdges.forEach { edge ->
+                                            val sourceLabel = nodesById[edge.source]?.label ?: edge.source
+                                            val targetLabel = nodesById[edge.target]?.label ?: edge.target
+                                            val relationLabel = edgeLabels[edge.relation] ?: edge.relation
+                                            val probText =
+                                                edge.prob.takeIf { it.isNotBlank() }?.let {
+                                                    (it.toFloatOrNull()?.times(100))?.toInt()?.let { pct -> " · $pct%" }
+                                                }.orEmpty()
+                                            Surface(
+                                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                                color = GraphBg,
+                                                shape = RoundedCornerShape(12.dp),
+                                            ) {
+                                                Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                                                    Text("$sourceLabel  →  $targetLabel", fontSize = 12.sp, color = Color.White)
+                                                    Spacer(Modifier.height(2.dp))
+                                                    Text("$relationLabel$probText", fontSize = 11.sp, color = nodeColor.copy(alpha = 0.82f))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         Card(
-                            Modifier.fillMaxWidth().padding(top = 8.dp),
+                            Modifier.fillMaxWidth().padding(top = 12.dp),
                             colors = CardDefaults.cardColors(containerColor = GraphCard),
                             shape = RoundedCornerShape(16.dp),
                             border = BorderStroke(1.dp, Color.White.copy(alpha = 0.06f)),
                         ) {
                             Column(Modifier.padding(14.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Box(Modifier.size(10.dp).background(nodeColor, CircleShape))
-                                    Spacer(Modifier.width(8.dp))
-                                    Column(Modifier.weight(1f)) {
-                                        Text(node.label, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                                        Text("${typeLabels[node.type] ?: node.type} · ${node.id}", fontSize = 11.sp, color = Color.White.copy(alpha = 0.56f))
-                                    }
-                                    StatusChip("${relatedEdges.size} 条关联边", nodeColor.copy(alpha = 0.16f), nodeColor)
+                                    Text("全部关联边", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                    Spacer(Modifier.weight(1f))
+                                    StatusChip("${edges.size} 条", GraphAccent.copy(alpha = 0.16f), GraphAccent)
                                 }
-                                Spacer(Modifier.height(12.dp))
-                                if (relatedEdges.isEmpty()) {
-                                    Text("当前节点暂无关联边。", fontSize = 12.sp, color = Color.White.copy(alpha = 0.55f))
+                                Spacer(Modifier.height(10.dp))
+                                if (edges.isEmpty()) {
+                                    Text("当前图谱没有可显示的边。", fontSize = 12.sp, color = Color.White.copy(alpha = 0.55f))
                                 } else {
-                                    relatedEdges.forEach { edge ->
+                                    edges.forEach { edge ->
                                         val sourceLabel = nodesById[edge.source]?.label ?: edge.source
                                         val targetLabel = nodesById[edge.target]?.label ?: edge.target
                                         val relationLabel = edgeLabels[edge.relation] ?: edge.relation
-                                        val probText =
-                                            edge.prob.takeIf { it.isNotBlank() }?.let {
-                                                (it.toFloatOrNull()?.times(100))?.toInt()?.let { pct -> " · $pct%" }
-                                            }.orEmpty()
+                                        val relationColor =
+                                            typeColors[nodesById[edge.target]?.type ?: ""] ?:
+                                                typeColors[nodesById[edge.source]?.type ?: ""] ?:
+                                                GraphAccent
                                         Surface(
                                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                                             color = GraphBg,
                                             shape = RoundedCornerShape(12.dp),
                                         ) {
-                                            Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-                                                Text("$sourceLabel  →  $targetLabel", fontSize = 12.sp, color = Color.White)
-                                                Spacer(Modifier.height(2.dp))
-                                                Text("$relationLabel$probText", fontSize = 11.sp, color = nodeColor.copy(alpha = 0.82f))
+                                            Row(
+                                                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                Box(Modifier.size(8.dp).background(relationColor, CircleShape))
+                                                Spacer(Modifier.width(8.dp))
+                                                Column(Modifier.weight(1f)) {
+                                                    Text("$sourceLabel  →  $targetLabel", fontSize = 12.sp, color = Color.White)
+                                                    val probText =
+                                                        edge.prob.takeIf { it.isNotBlank() }?.let {
+                                                            (it.toFloatOrNull()?.times(100))?.toInt()?.let { pct -> " · $pct%" }
+                                                        }.orEmpty()
+                                                    Text("$relationLabel$probText", fontSize = 11.sp, color = Color.White.copy(alpha = 0.6f))
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
+                        Spacer(Modifier.height(16.dp))
                     }
-
-                    Card(
-                        Modifier.fillMaxWidth().padding(top = 12.dp),
-                        colors = CardDefaults.cardColors(containerColor = GraphCard),
-                        shape = RoundedCornerShape(16.dp),
-                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.06f)),
-                    ) {
-                        Column(Modifier.padding(14.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text("全部关联边", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                                Spacer(Modifier.weight(1f))
-                                StatusChip("${edges.size} 条", GraphAccent.copy(alpha = 0.16f), GraphAccent)
-                            }
-                            Spacer(Modifier.height(10.dp))
-                            if (edges.isEmpty()) {
-                                Text("当前图谱没有可显示的边。", fontSize = 12.sp, color = Color.White.copy(alpha = 0.55f))
-                            } else {
-                                edges.forEach { edge ->
-                                    val sourceLabel = nodesById[edge.source]?.label ?: edge.source
-                                    val targetLabel = nodesById[edge.target]?.label ?: edge.target
-                                    val relationLabel = edgeLabels[edge.relation] ?: edge.relation
-                                    val relationColor =
-                                        typeColors[nodesById[edge.target]?.type ?: ""] ?:
-                                            typeColors[nodesById[edge.source]?.type ?: ""] ?:
-                                            GraphAccent
-                                    Surface(
-                                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                        color = GraphBg,
-                                        shape = RoundedCornerShape(12.dp),
-                                    ) {
-                                        Row(
-                                            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                        ) {
-                                            Box(Modifier.size(8.dp).background(relationColor, CircleShape))
-                                            Spacer(Modifier.width(8.dp))
-                                            Column(Modifier.weight(1f)) {
-                                                Text("$sourceLabel  →  $targetLabel", fontSize = 12.sp, color = Color.White)
-                                                val probText =
-                                                    edge.prob.takeIf { it.isNotBlank() }?.let {
-                                                        (it.toFloatOrNull()?.times(100))?.toInt()?.let { pct -> " · $pct%" }
-                                                    }.orEmpty()
-                                                Text("$relationLabel$probText", fontSize = 11.sp, color = Color.White.copy(alpha = 0.6f))
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(16.dp))
                 }
             }
         }
@@ -3760,20 +3945,98 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
 
 // ==================== GraphRAG ====================
 
-private fun buildGraphRAGReport(userInput: String, graph: MaintenanceKnowledgeGraph): Pair<DiagnosticReport, String>? {
-    val equipmentNodes = graph.findEquipment(userInput)
-    if (equipmentNodes.isEmpty()) return null
-    val equipment = equipmentNodes.first()
-    val allSymptoms = mutableListOf<GraphNode>()
-    for (kw in SYMPTOM_KEYWORDS) {
-        if (userInput.contains(kw)) allSymptoms.addAll(graph.findSymptoms(equipment.id, kw))
+private fun buildConversationRetrievalText(
+    currentUserText: String,
+    conversationHistory: List<Pair<String, String>>,
+): String {
+    val recentContext = conversationHistory
+        .takeLast(8)
+        .joinToString("\n") { (role, content) -> "$role: ${content.take(800)}" }
+    return listOf(recentContext, currentUserText)
+        .filter { it.isNotBlank() }
+        .joinToString("\n")
+}
+
+private fun buildEquipmentContextRetrievalText(
+    currentUserText: String,
+    retrievalText: String,
+    activeEquipment: GraphNode?,
+): String {
+    val equipmentContext = activeEquipment?.let { "当前会话设备：${buildEquipmentContextLabel(it)}" }
+    return listOf(equipmentContext, retrievalText, currentUserText)
+        .filter { !it.isNullOrBlank() }
+        .joinToString("\n")
+}
+
+private fun buildEquipmentContextLabel(equipment: GraphNode): String {
+    val identifiers = mutableListOf(equipment.label)
+    equipment.properties["配置号"]?.takeIf { it.isNotBlank() }?.let { identifiers.add("配置号：$it") }
+    equipment.properties["brand"]?.takeIf { it.isNotBlank() }?.let { identifiers.add("品牌：$it") }
+    equipment.properties["model"]?.takeIf { it.isNotBlank() }?.let { identifiers.add("型号：$it") }
+    equipment.properties["location"]?.takeIf { it.isNotBlank() }?.let { identifiers.add("位置：$it") }
+    return identifiers.joinToString("，")
+}
+
+private fun buildEquipmentLookupAnswer(
+    currentUserText: String,
+    retrievalText: String,
+    graph: MaintenanceKnowledgeGraph,
+): Pair<GraphNode, String>? {
+    if (!isEquipmentLookupQuestion(currentUserText)) return null
+    val equipment = graph.findEquipment(retrievalText).firstOrNull() ?: return null
+    val details = mutableListOf<String>()
+    equipment.properties["配置号"]?.takeIf { it.isNotBlank() }?.let { details.add("配置号：$it") }
+    listOf("brand" to "品牌", "model" to "型号", "year" to "年份", "location" to "位置").forEach { (key, label) ->
+        equipment.properties[key]?.takeIf { it.isNotBlank() }?.let { details.add("$label：$it") }
     }
-    if (allSymptoms.isEmpty()) return null
-    val symptom = allSymptoms.first()
+    val answer = buildString {
+        append("根据当前上下文和知识库匹配到：${equipment.label}")
+        if (details.isNotEmpty()) append("。\n${details.joinToString("\n")}")
+    }
+    return equipment to answer
+}
+
+private fun isEquipmentLookupQuestion(text: String): Boolean {
+    val normalized = text.trim()
+    if (normalized.isBlank()) return false
+    val lookupKeywords = listOf("几号叉车", "哪台叉车", "是哪台", "这是哪台", "哪个叉车", "设备编号", "配置号", "序列号")
+    val asksLookup = lookupKeywords.any { normalized.contains(it) }
+    val hasSymptom = SYMPTOM_KEYWORDS.any { normalized.contains(it) }
+    return asksLookup && !hasSymptom
+}
+
+private fun buildGraphRAGReport(
+    userInput: String,
+    graph: MaintenanceKnowledgeGraph,
+    preferredEquipment: GraphNode? = null,
+): Pair<DiagnosticReport, String>? {
+    val matchedKeywords = SYMPTOM_KEYWORDS.filter { userInput.contains(it) }
+    if (matchedKeywords.isEmpty()) return null
+
+    val equipment = preferredEquipment ?: graph.findEquipment(userInput).firstOrNull() ?: return null
+    val directSymptom =
+        matchedKeywords
+            .asSequence()
+            .flatMap { keyword -> graph.findSymptoms(equipment.id, keyword).asSequence() }
+            .firstOrNull()
+    val symptom =
+        directSymptom
+            ?: matchedKeywords.firstNotNullOfOrNull { keyword -> findReferenceSymptom(keyword, graph) }
+            ?: return null
+    val isDirectSymptom = directSymptom != null
     val sub = graph.traverseFromNode(symptom.id, maxHops = 4)
     val wos = graph.matchWorkOrders(symptom.id)
-    val graphJson = graph.subGraphToJson(sub)
-    Log.d("PocketOps", "GraphRAG report: equipment=${equipment.label}, symptom=${symptom.label}, causes=${sub.nodes.count { it.type == NodeType.ROOT_CAUSE }}, workOrders=${wos.size}")
+    val reportSubGraph =
+        if (isDirectSymptom) {
+            sub
+        } else {
+            buildContextualSubGraph(equipment, symptom, sub)
+        }
+    val graphJson = graph.subGraphToJson(reportSubGraph)
+    Log.d(
+        "PocketOps",
+        "GraphRAG report: equipment=${equipment.label}, symptom=${symptom.label}, contextual=${!isDirectSymptom}, causes=${sub.nodes.count { it.type == NodeType.ROOT_CAUSE }}, workOrders=${wos.size}",
+    )
     val report = DiagnosticReport(
         equipment = equipment, symptom = symptom,
         causes = sub.nodes.filter { it.type == NodeType.ROOT_CAUSE }.sortedByDescending { it.properties["probability"]?.toFloatOrNull() ?: 0f },
@@ -3784,6 +4047,37 @@ private fun buildGraphRAGReport(userInput: String, graph: MaintenanceKnowledgeGr
         nodeCount = sub.nodes.size,
     )
     return report to graphJson
+}
+
+private fun findReferenceSymptom(symptomKeyword: String, graph: MaintenanceKnowledgeGraph): GraphNode? {
+    val allEquipment = graph.findEquipment("叉车")
+    for (equipment in allEquipment) {
+        graph.findSymptoms(equipment.id, symptomKeyword).firstOrNull()?.let { return it }
+    }
+    return null
+}
+
+private fun buildContextualSubGraph(
+    equipment: GraphNode,
+    symptom: GraphNode,
+    sourceSubGraph: SubGraph,
+): SubGraph {
+    val nodes =
+        (listOf(equipment) + sourceSubGraph.nodes.filter { node ->
+            node.type != NodeType.EQUIPMENT || node.id == equipment.id
+        }).distinctBy { it.id }
+    val nodeIds = nodes.map { it.id }.toSet()
+    val contextualEdge = GraphEdge(
+        source = equipment.id,
+        target = symptom.id,
+        relation = "HAS_SYMPTOM",
+        properties = mapOf("source" to "current_context"),
+    )
+    val edges =
+        (listOf(contextualEdge) + sourceSubGraph.edges.filter { edge ->
+            edge.source in nodeIds && edge.target in nodeIds
+        }).distinctBy { "${it.source}|${it.target}|${it.relation}" }
+    return SubGraph(nodes = nodes, edges = edges, centerNodeId = equipment.id)
 }
 
 private fun findRelatedWorkOrders(userInput: String, graph: MaintenanceKnowledgeGraph): List<GraphNode> {

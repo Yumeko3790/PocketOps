@@ -6,6 +6,7 @@
 
 当前脚本 `mock_pocketops_server.py` 会：
 
+- 返回 `POST /api/pocketops/auth/login`
 - 返回 `GET /api/pocketops/bootstrap/manifest`
 - 返回 `POST /api/pocketops/materials/query`
 - 通过 `/files/...` 提供静态资源下载
@@ -55,6 +56,14 @@ python demo/mock_pocketops_server.py \
   --min-supported-app-version 1.0.11
 ```
 
+覆盖演示登录账号：
+
+```bash
+python demo/mock_pocketops_server.py \
+  --demo-username engineer \
+  --demo-password PocketOps@2026
+```
+
 ## 自动搜索 knowledge graph 的逻辑
 
 如果没有传 `--knowledge-graph`，脚本会按顺序尝试：
@@ -68,10 +77,29 @@ python demo/mock_pocketops_server.py \
 
 ## 暴露的接口
 
-### 1. 启动同步清单
+### 1. 登录
+
+```http
+POST /api/pocketops/auth/login
+Content-Type: application/json
+```
+
+默认演示账号：
+
+- 账号：`engineer`
+- 密码：`PocketOps@2026`
+
+成功后返回 `accessToken`。后续 `manifest`、`materials/query` 和 `/files/...` 下载请求都需要带：
+
+```http
+Authorization: Bearer <accessToken>
+```
+
+### 2. 启动同步清单
 
 ```http
 GET /api/pocketops/bootstrap/manifest
+Authorization: Bearer <accessToken>
 ```
 
 返回字段包括：
@@ -81,11 +109,12 @@ GET /api/pocketops/bootstrap/manifest
 - `displaySteps`
 - `resources`
 
-### 2. 诊断资料列表
+### 3. 诊断资料列表
 
 ```http
 POST /api/pocketops/materials/query
 Content-Type: application/json
+Authorization: Bearer <accessToken>
 ```
 
 请求体示例：
@@ -98,12 +127,13 @@ Content-Type: application/json
 }
 ```
 
-### 3. 文件下载
+### 4. 文件下载
 
 ```http
 GET  /files/core/knowledge_graph.json
 HEAD /files/core/knowledge_graph.json
 GET  /files/materials/hydraulic_pump_sop.pdf
+Authorization: Bearer <accessToken>
 Range: bytes=0-1023
 ```
 
@@ -125,24 +155,36 @@ Range: bytes=0-1023
 
 ## 用 curl 快速验证
 
-### 1. 看 manifest
+### 1. 登录并保存 token
 
 ```bash
-curl http://127.0.0.1:8080/api/pocketops/bootstrap/manifest
+TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/pocketops/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"engineer","password":"PocketOps@2026"}' \
+  | python -c "import json,sys; print(json.load(sys.stdin)['accessToken'])")
 ```
 
-### 2. 查资料列表
+### 2. 看 manifest
+
+```bash
+curl http://127.0.0.1:8080/api/pocketops/bootstrap/manifest \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### 3. 查资料列表
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/pocketops/materials/query \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
   -d '{"equipmentId":"eq_001","symptomId":"sym_001","workOrderIds":["wo_1024"]}'
 ```
 
-### 3. 验证 range 下载
+### 4. 验证 range 下载
 
 ```bash
 curl http://127.0.0.1:8080/files/core/knowledge_graph.json \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Range: bytes=0-1023" \
   -o partial.json
 ```
@@ -173,17 +215,17 @@ http://127.0.0.1:8080
 
 ## Android demo 流程建议
 
-1. 打开登录页并配置 demo server URL
-2. 登录
-3. 客户端拉取远程 `manifest`
-4. 下载 `knowledge_graph.json`
-5. 生成诊断结果
-6. 打开工单页并点击获取资料
-7. 触发真实文件下载
+1. 打开登录页，可选择配置 demo server URL
+2. 点击 `进入工作台`
+3. 如果电脑服务可用，客户端先走服务端认证并携带 token 拉取远程 `manifest`
+4. 如果电脑服务不可用，客户端用离线凭据进入，并按原启动逻辑尝试缓存知识库
+5. 如果缓存知识库也不可用，客户端加载 APK 内置知识库
+6. 生成诊断结果
+7. 打开工单页并点击获取资料；资料接口不可用时仍可本地导出工单
 
 ## 当前实现限制
 
-- 没有真实鉴权
+- 只有演示账号密码和内存 token，没有生产级用户、租户、审计和 token 刷新
 - 没有数据库
 - 没有对象存储/CDN
 - `summary` 里的统计大部分是演示值

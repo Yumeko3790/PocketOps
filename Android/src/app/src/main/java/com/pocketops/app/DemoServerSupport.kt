@@ -2,7 +2,9 @@ package com.pocketops.app
 
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.net.Uri
+import android.util.Log
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
@@ -18,7 +20,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
 import com.google.gson.Gson
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
@@ -29,8 +35,15 @@ import java.util.zip.ZipInputStream
 
 private const val DEMO_SERVER_PREFS = "pocketops_demo_server"
 private const val DEMO_SERVER_BASE_URL_KEY = "base_url"
+private const val LOGIN_PREFS = "pocketops_login"
+private const val LOGIN_USERNAME_KEY = "username"
+private const val LOGIN_PASSWORD_KEY = "password"
+private const val LOGIN_REMEMBER_PASSWORD_KEY = "remember_password"
 private const val DEMO_SYNC_ROOT_DIR = "pocketops_demo_sync"
 private const val DEMO_MATERIALS_DIR = "documents/materials"
+private const val OFFLINE_USERNAME = "engineer"
+private const val OFFLINE_PASSWORD = "PocketOps@2026"
+private const val TAG = "PocketOpsDemoSupport"
 
 data class DemoSyncSummary(
     val equipmentCount: Int = 0,
@@ -104,6 +117,31 @@ private data class DemoHttpResponse(
     val body: String,
 )
 
+data class PocketOpsSession(
+    val accessToken: String = "",
+    val userId: String = "",
+    val displayName: String = "",
+    val role: String = "",
+    val expiresInSeconds: Long = 0L,
+    val isOffline: Boolean = false,
+)
+
+data class SavedLoginCredentials(
+    val username: String = "",
+    val password: String = "",
+    val rememberPassword: Boolean = false,
+)
+
+private data class PocketOpsLoginResponse(
+    val accessToken: String = "",
+    val userId: String = "",
+    val displayName: String = "",
+    val role: String = "",
+    val expiresInSeconds: Long = 0L,
+)
+
+private class OnlineAuthenticationRejected(message: String) : IllegalStateException(message)
+
 fun loadDemoServerBaseUrl(context: Context): String {
     val prefs = context.getSharedPreferences(DEMO_SERVER_PREFS, Context.MODE_PRIVATE)
     return prefs.getString(DEMO_SERVER_BASE_URL_KEY, "") ?: ""
@@ -125,6 +163,125 @@ fun normalizeDemoServerBaseUrl(raw: String): String {
         trimmed
     } else {
         "http://$trimmed"
+    }
+}
+
+fun loadSavedLoginCredentials(context: Context): SavedLoginCredentials {
+    val prefs = loginPrefs(context)
+    val rememberPassword = prefs.getBoolean(LOGIN_REMEMBER_PASSWORD_KEY, false)
+    return SavedLoginCredentials(
+        username = prefs.getString(LOGIN_USERNAME_KEY, "") ?: "",
+        password = if (rememberPassword) prefs.getString(LOGIN_PASSWORD_KEY, "") ?: "" else "",
+        rememberPassword = rememberPassword,
+    )
+}
+
+fun saveLoginCredentials(
+    context: Context,
+    username: String,
+    password: String,
+    rememberPassword: Boolean,
+) {
+    loginPrefs(context).edit()
+        .putString(LOGIN_USERNAME_KEY, username.trim())
+        .putBoolean(LOGIN_REMEMBER_PASSWORD_KEY, rememberPassword)
+        .apply {
+            if (rememberPassword) {
+                putString(LOGIN_PASSWORD_KEY, password)
+            } else {
+                remove(LOGIN_PASSWORD_KEY)
+            }
+        }
+        .apply()
+}
+
+fun authenticatePocketOpsOfflineUser(username: String, password: String): PocketOpsSession {
+    check(username.isNotBlank()) { "请输入工号 / 账号" }
+    check(password.isNotBlank()) { "请输入密码" }
+    check(username.trim() == OFFLINE_USERNAME && password == OFFLINE_PASSWORD) {
+        "离线账号或密码错误"
+    }
+    return PocketOpsSession(
+        userId = OFFLINE_USERNAME,
+        displayName = "维修工程师",
+        role = "maintenance_engineer",
+        isOffline = true,
+    )
+}
+
+private fun loginPrefs(context: Context): SharedPreferences {
+    return try {
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        EncryptedSharedPreferences.create(
+            context,
+            LOGIN_PREFS,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+        )
+    } catch (e: Exception) {
+        Log.e(TAG, "Encrypted login prefs unavailable, using private SharedPreferences", e)
+        context.getSharedPreferences(LOGIN_PREFS, Context.MODE_PRIVATE)
+    }
+}
+
+suspend fun authenticatePocketOpsUser(
+    baseUrl: String,
+    username: String,
+    password: String,
+): PocketOpsSession {
+    check(username.isNotBlank()) { "请输入工号 / 账号" }
+    check(password.isNotBlank()) { "请输入密码" }
+
+    val normalized = normalizeDemoServerBaseUrl(baseUrl)
+    if (normalized.isBlank()) {
+        return authenticatePocketOpsOfflineUser(username, password)
+    }
+
+    return try {
+        authenticatePocketOpsOnlineUser(normalized, username, password)
+    } catch (e: OnlineAuthenticationRejected) {
+        throw e
+    } catch (e: Exception) {
+        Log.e(TAG, "Online authentication unavailable, trying offline credentials", e)
+        authenticatePocketOpsOfflineUser(username, password)
+    }
+}
+
+private suspend fun authenticatePocketOpsOnlineUser(
+    normalizedBaseUrl: String,
+    username: String,
+    password: String,
+): PocketOpsSession {
+    return withContext(Dispatchers.IO) {
+        val payload = org.json.JSONObject().apply {
+            put("username", username.trim())
+            put("password", password)
+        }
+        val response = sendDemoJsonRequest(
+            url = "$normalizedBaseUrl/api/pocketops/auth/login",
+            method = "POST",
+            body = payload.toString(),
+        )
+        if (response.code == 401 || response.code == 403) {
+            throw OnlineAuthenticationRejected(buildDemoHttpError("登录失败", response.code, response.body))
+        }
+        if (response.code !in 200..299) {
+            throw IllegalStateException(buildDemoHttpError("登录失败", response.code, response.body))
+        }
+
+        val login = Gson().fromJson(response.body, PocketOpsLoginResponse::class.java)
+        check(login.accessToken.isNotBlank()) { "登录失败：服务端未返回访问令牌" }
+        PocketOpsSession(
+            accessToken = login.accessToken,
+            userId = login.userId,
+            displayName = login.displayName,
+            role = login.role,
+            expiresInSeconds = login.expiresInSeconds,
+            isOffline = false,
+        )
     }
 }
 
@@ -195,13 +352,14 @@ fun DemoSyncSummary.toStatusLine(): String {
     return parts.joinToString(" · ")
 }
 
-suspend fun fetchDemoManifest(baseUrl: String): DemoManifest {
+suspend fun fetchDemoManifest(baseUrl: String, accessToken: String): DemoManifest {
     val normalized = normalizeDemoServerBaseUrl(baseUrl)
     check(normalized.isNotBlank()) { "\u7535\u8111\u670d\u52a1\u5730\u5740\u4e0d\u80fd\u4e3a\u7a7a" }
 
     val response = sendDemoJsonRequest(
         url = "$normalized/api/pocketops/bootstrap/manifest?tenantId=demo&siteId=demo&appVersion=1.0.11",
         method = "GET",
+        bearerToken = accessToken,
     )
     if (response.code !in 200..299) {
         throw IllegalStateException(buildDemoHttpError("获取同步清单失败", response.code, response.body))
@@ -209,7 +367,7 @@ suspend fun fetchDemoManifest(baseUrl: String): DemoManifest {
     return Gson().fromJson(response.body, DemoManifest::class.java)
 }
 
-suspend fun syncDemoResource(context: Context, resource: DemoResource): File {
+suspend fun syncDemoResource(context: Context, resource: DemoResource, accessToken: String): File {
     val targetFile = getDemoResourceFile(context, resource.localPath)
     val expectedSha = resource.sha256.trim().lowercase(Locale.US)
 
@@ -228,6 +386,7 @@ suspend fun syncDemoResource(context: Context, resource: DemoResource): File {
     connection.requestMethod = "GET"
     connection.connectTimeout = 10_000
     connection.readTimeout = 30_000
+    connection.setBearerToken(accessToken)
     connection.connect()
 
     try {
@@ -286,7 +445,11 @@ fun getDemoResourceFile(context: Context, localPath: String): File {
     return File(File(context.filesDir, DEMO_SYNC_ROOT_DIR), safePath)
 }
 
-suspend fun queryDemoMaterials(baseUrl: String, message: PocketMessage): List<DemoMaterial> {
+suspend fun queryDemoMaterials(
+    baseUrl: String,
+    message: PocketMessage,
+    accessToken: String,
+): List<DemoMaterial> {
     val normalized = normalizeDemoServerBaseUrl(baseUrl)
     if (normalized.isBlank()) {
         return emptyList()
@@ -326,6 +489,7 @@ suspend fun queryDemoMaterials(baseUrl: String, message: PocketMessage): List<De
         url = "$normalized/api/pocketops/materials/query",
         method = "POST",
         body = payload.toString(),
+        bearerToken = accessToken,
     )
     if (response.code !in 200..299) {
         throw IllegalStateException(buildDemoHttpError("获取资料列表失败", response.code, response.body))
@@ -333,7 +497,7 @@ suspend fun queryDemoMaterials(baseUrl: String, message: PocketMessage): List<De
     return Gson().fromJson(response.body, DemoMaterialsResponse::class.java).materials
 }
 
-suspend fun downloadDemoMaterial(context: Context, material: DemoMaterial): File {
+suspend fun downloadDemoMaterial(context: Context, material: DemoMaterial, accessToken: String): File {
     val targetDir = File(context.cacheDir, DEMO_MATERIALS_DIR).apply { mkdirs() }
     val extension = guessDemoExtension(material)
     val fileName = sanitizeDemoFileName(material.title.ifBlank { material.id.ifBlank { "material" } })
@@ -352,6 +516,7 @@ suspend fun downloadDemoMaterial(context: Context, material: DemoMaterial): File
     connection.requestMethod = "GET"
     connection.connectTimeout = 10_000
     connection.readTimeout = 30_000
+    connection.setBearerToken(accessToken)
     connection.connect()
 
     try {
@@ -551,12 +716,14 @@ private fun sendDemoJsonRequest(
     url: String,
     method: String,
     body: String? = null,
+    bearerToken: String? = null,
 ): DemoHttpResponse {
     val connection = URL(url).openConnection() as HttpURLConnection
     connection.requestMethod = method
     connection.connectTimeout = 10_000
     connection.readTimeout = 30_000
     connection.setRequestProperty("Content-Type", "application/json")
+    connection.setBearerToken(bearerToken)
 
     if (!body.isNullOrBlank()) {
         connection.doOutput = true
@@ -572,6 +739,12 @@ private fun sendDemoJsonRequest(
         DemoHttpResponse(code = code, body = responseBody)
     } finally {
         connection.disconnect()
+    }
+}
+
+private fun HttpURLConnection.setBearerToken(token: String?) {
+    if (!token.isNullOrBlank()) {
+        setRequestProperty("Authorization", "Bearer $token")
     }
 }
 
