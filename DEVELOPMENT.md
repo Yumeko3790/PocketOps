@@ -9,29 +9,32 @@ The current production path is:
 - launcher activity: `com.pocketops.app.PocketOpsActivity`
 - embedded foreground service: `com.pocketops.app.GenieHttpService`
 - app id: `com.pocketops.app`
-- retained namespace: `com.google.ai.edge.gallery`
-- retained application class: `com.google.ai.edge.gallery.GalleryApplication`
+- namespace: `com.pocketops.app`
+- application class: none
 - local inference endpoint: `127.0.0.1:8910`
 - build target: Android 12+ (`minSdk 31`) on `arm64-v8a`
 
 If you are trying to understand "what the app does today", start from
-`PocketOpsActivity.kt` and `GenieHttpService.kt`, not from the retained Gallery
-shell.
+`PocketOpsActivity.kt` and `GenieHttpService.kt`.
 
 ## Production runtime path
 
 ### Startup sequence
 
-`PocketOpsActivity.refreshGenieServiceStatus()` currently does the following:
+`PocketOpsActivity.refreshGenieServiceStatusWithDemo()` currently does the following:
 
-1. load `assets/maintenance/knowledge_graph.json`
-2. render a staged sync / loading experience
-3. probe `GET http://127.0.0.1:8910/v1/models`
-4. treat the service as ready only if it returns model metadata that is loaded
-5. if the model is not ready and Android 11+ has not granted all-files access,
+1. normalize the configured demo server URL
+2. if a demo server is configured, fetch the remote manifest and sync the boot
+   knowledge graph resource
+3. if remote sync fails, fall back to the cached demo graph when available
+4. otherwise load `assets/maintenance/knowledge_graph.json`
+5. render a staged sync / loading experience
+6. probe `GET http://127.0.0.1:8910/v1/models`
+7. treat the service as ready only if it returns model metadata that is loaded
+8. if the model is not ready and Android 11+ has not granted all-files access,
    surface a settings handoff for `/sdcard/GenieModels`
-6. otherwise start `GenieHttpService` as a foreground service
-7. poll until the embedded native HTTP service reports readiness
+9. otherwise start `GenieHttpService` as a foreground service
+10. poll until the embedded native HTTP service reports readiness
 
 The current polling window is roughly 180 seconds.
 
@@ -68,8 +71,8 @@ reuses it instead of starting another instance.
 
 ### GraphRAG responsibilities
 
-The retained maintenance knowledge-graph path is still part of the production
-flow. Its main responsibilities are:
+The maintenance knowledge-graph path is part of the production flow. Its main
+responsibilities are:
 
 - equipment matching
 - symptom matching
@@ -80,8 +83,8 @@ flow. Its main responsibilities are:
 
 Primary files:
 
-- `Android/src/app/src/main/java/com/google/ai/edge/gallery/customtasks/maintenance/MaintenanceKnowledgeGraph.kt`
-- `Android/src/app/src/main/java/com/google/ai/edge/gallery/customtasks/maintenance/MaintenanceTypes.kt`
+- `Android/src/app/src/main/java/com/pocketops/app/MaintenanceKnowledgeGraph.kt`
+- `Android/src/app/src/main/java/com/pocketops/app/MaintenanceTypes.kt`
 - `Android/src/app/src/main/assets/maintenance/knowledge_graph.json`
 
 ## HTTP contract
@@ -90,15 +93,16 @@ The current PocketOps mainline uses:
 
 - `GET /v1/models` for readiness checks
 - `POST /v1/chat/completions` for text, image, and video diagnosis
-- `POST /clear` to reset service-side chat state before text inference
+- `POST /clear` to reset service-side chat state before each text, image, or
+  video diagnosis request
 
 Operational notes:
 
 - readiness requires returned model metadata, not just an open localhost port
 - text inference is consumed as a stream
 - image/video requests are sent as non-streaming multimodal payloads
-- PocketOps resets the service-side text conversation before each new text
-  diagnosis request
+- PocketOps resets the service-side conversation before each new diagnosis
+  request
 
 ## Runtime dependencies
 
@@ -123,43 +127,28 @@ behavior, inspect these files together:
 - `Android/src/app/src/main/AndroidManifest.xml`
   - launcher/service wiring, permissions, FileProvider, cleartext allowance
 - `Android/src/app/build.gradle.kts`
-  - app id, SDK levels, ABI filters, manifest placeholders
-- root `model_allowlist.json`
-  - retained Gallery-era model metadata path
-- `model_allowlists/*.json`
-  - historical or release-specific allowlist snapshots
+  - app id, namespace, SDK levels, ABI filters, dependency surface
 
-Do not assume the PocketOps runtime model id and the retained Gallery allowlist
-model id are the same thing.
+The old Gallery allowlist files were removed. Treat the model id in
+`PocketOpsActivity` and the `/v1/models` response from the local service as the
+runtime source of truth.
 
-## Retained HuggingFace / Gallery modules
+## Removed HuggingFace / Gallery modules
 
-This codebase still contains inherited Google AI Edge Gallery modules for model
-management, HuggingFace auth, downloads, agent skills, and task navigation.
-
-If you intentionally re-enable those retained upstream features, you may also
-need to update:
-
-- `Android/src/app/src/main/java/com/google/ai/edge/gallery/common/ProjectConfig.kt`
-- `Android/src/app/build.gradle.kts`
-  - `manifestPlaceholders["appAuthRedirectScheme"]`
-
-Those settings are not part of the default PocketOps diagnosis flow.
+Inherited Google AI Edge Gallery modules for model management, HuggingFace auth,
+downloads, agent skills, custom tasks, Proto DataStore, Hilt, WorkManager, and
+task navigation have been removed from the Android source tree. Reintroducing
+one of those features should be treated as a new scoped integration, including
+dependencies, manifest entries, tests, and docs.
 
 ## Directory ownership
 
 Use this as the current code-ownership map:
 
 - `Android/src/app/src/main/java/com/pocketops/app/`
-  - production launcher path, PocketOps UI, embedded service
-- `Android/src/app/src/main/java/com/google/ai/edge/gallery/customtasks/maintenance/`
-  - knowledge graph logic and retained maintenance data structures
-- `Android/src/app/src/main/java/com/google/ai/edge/gallery/`
-  - inherited Gallery shell, app infrastructure, retained task framework
+  - production launcher path, PocketOps UI, GraphRAG logic, embedded service
 - `Android/src/app/src/main/assets/maintenance/`
-  - knowledge graph payload and related runtime assets
-- `skills/` and `Android/src/app/src/main/assets/skills/`
-  - retained skills documentation and bundled skill resources
+  - knowledge graph payload
 
 ## Build and debug locally
 
@@ -182,17 +171,17 @@ Useful runtime log tags:
 
 - `PocketOps`
 - `GenieHttpService`
-- `AGMaintenanceKG`
+- `PocketOpsKG`
 
 Example filtered logcat:
 
 ```shell
-adb logcat PocketOps:D GenieHttpService:D AGMaintenanceKG:D *:S
+adb logcat PocketOps:D GenieHttpService:D PocketOpsKG:D *:S
 ```
 
-## Retained but non-default modules
+## Removed non-default modules
 
-These paths still exist, but they are not the default production mainline:
+These paths were removed because they were not part of the production mainline:
 
 - `MainActivity` + Gallery navigation shell
 - `MaintenanceTask` + `MaintenanceScreen`
@@ -202,7 +191,9 @@ These paths still exist, but they are not the default production mainline:
 - `skills/` guide + sample skills
 - `customtasks/mobileactions/`
 - `genie_jni.cpp`
+- `model_allowlist.json` and `model_allowlists/`
+- `Android/src/app/src/main/proto/`
+- `Android/src/app/src/main/assets/tinygarden/`
 
-They remain useful for historical context, debugging, or future experiments,
-but they should not be confused with the current
-`PocketOpsActivity + GenieHttpService` path.
+Do not add references to these paths back to docs unless the corresponding code
+is restored intentionally.

@@ -45,7 +45,7 @@ python demo/mock_pocketops_server.py --host 0.0.0.0 --port 8080
 
 ```bash
 python demo/mock_pocketops_server.py \
-  --knowledge-graph D:/aisrc/PocketOps/Android/src/app/src/main/assets/maintenance/knowledge_graph.json
+  --knowledge-graph Android/src/app/src/main/assets/maintenance/knowledge_graph.json
 ```
 
 覆盖版本信息：
@@ -53,7 +53,7 @@ python demo/mock_pocketops_server.py \
 ```bash
 python demo/mock_pocketops_server.py \
   --sync-version 2026-05-06.demo.2 \
-  --min-supported-app-version 1.0.11
+  --min-supported-app-version 4.8
 ```
 
 覆盖演示登录账号：

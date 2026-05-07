@@ -80,7 +80,7 @@ If you can reproduce the issue while connected to a computer, a focused logcat
 is often useful in addition to the full bug report.
 
 ```shell
-adb logcat PocketOps:D GenieHttpService:D AGMaintenanceKG:D *:S > pocketops-logcat.txt
+adb logcat PocketOps:D GenieHttpService:D PocketOpsKG:D *:S > pocketops-logcat.txt
 ```
 
 If you need the full logcat instead:
@@ -111,7 +111,7 @@ These details help separate:
 
 - UI issues in `PocketOpsActivity`
 - startup or model-readiness issues in `GenieHttpService`
-- GraphRAG / data issues in `AGMaintenanceKG`
+- GraphRAG / data issues in `PocketOpsKG`
 - output-format or parsing issues from the local inference service
 
 ## Understanding the report file

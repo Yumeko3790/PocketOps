@@ -76,14 +76,6 @@ import androidx.compose.ui.zIndex
 import androidx.core.content.FileProvider
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import com.google.ai.edge.gallery.customtasks.maintenance.DiagnosticReport
-import com.google.ai.edge.gallery.customtasks.maintenance.GraphEdge
-import com.google.ai.edge.gallery.customtasks.maintenance.GraphNode
-import com.google.ai.edge.gallery.customtasks.maintenance.MaintenanceKnowledgeGraph
-import com.google.ai.edge.gallery.customtasks.maintenance.NodeType
-import com.google.ai.edge.gallery.customtasks.maintenance.SubGraph
-import com.google.ai.edge.gallery.ui.common.MarkdownText
-import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -1001,7 +993,6 @@ data class PocketMessage(
     val graphJson: String = "",
 )
 
-@AndroidEntryPoint
 class PocketOpsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1308,119 +1299,6 @@ fun PocketOpsApp(
     val syncSteps = remember { mutableStateListOf<SyncStep>() }
     var npuLoadingSeconds by remember { mutableStateOf(0) }
     var npuLoading by remember { mutableStateOf(false) }
-
-    fun refreshGenieServiceStatus() {
-        if (isCheckingService) return
-        isCheckingService = true
-        genieReady = false
-        remoteBootstrapState = RemoteBootstrapState.NOT_CONFIGURED
-        needsModelDirectoryAccess = false
-        syncSteps.clear()
-        npuLoadingSeconds = 0
-        npuLoading = false
-        loadingText = "正在初始化..."
-
-        scope.launch(Dispatchers.IO) {
-            try {
-                // Step 1: Simulated cloud sync (while loading knowledge graph)
-                val steps = listOf(
-                    "连接云端知识库服务" to "",
-                    "同步设备档案" to "32 台设备 · 6 个车间",
-                    "同步故障案例库" to "286 条故障案例 · 45 种症状",
-                    "同步诊断知识图谱" to "1,247 个知识节点 · 3,892 条关系",
-                    "\u540c\u6b65\u7ef4\u4fee\u6807\u51c6\u6d41\u7a0b" to "168 \u6761\u6807\u51c6\u4f5c\u4e1a\u6d41\u7a0b",
-                    "同步备件与供应链数据" to "523 种备件 · 12 家供应商",
-                    "同步历史工单" to "2,156 条工单 · 近3年数据",
-                    "同步技术人员资质库" to "48 名技术员 · 15 项资质认证",
-                    "同步设备传感器阈值" to "96 组传感器参数 · 实时告警规则",
-                    "\u751f\u6210\u672c\u5730\u5411\u91cf\u7d22\u5f15" to "\u5411\u91cf\u7d22\u5f15 2048\u7ef4 \u00b7 \u6784\u5efa\u5b8c\u6210",
-                    "\u521d\u59cb\u5316\u7aef\u4fa7\u56fe\u8c31\u68c0\u7d22" to "4\u8df3\u904d\u5386 \u00b7 \u6beb\u79d2\u7ea7\u68c0\u7d22\u5c31\u7eea",
-                )
-
-                // Load knowledge graph during first few steps
-                if (knowledgeGraph.getNodeCount() == 0) {
-                    val kgJson = context.assets.open("maintenance/knowledge_graph.json")
-                        .bufferedReader().use { it.readText() }
-                    knowledgeGraph.loadFromJson(kgJson)
-                    Log.d(TAG, "Knowledge graph loaded")
-                }
-
-                for ((label, detail) in steps) {
-                    withContext(Dispatchers.Main) { syncSteps.add(SyncStep(label, detail)) }
-                    Thread.sleep((300L..700L).random())
-                }
-
-                // Step 2: Check if HTTP service already running
-                var ready = false
-                try {
-                    val conn = (java.net.URL("http://127.0.0.1:8910/v1/models").openConnection() as java.net.HttpURLConnection).apply {
-                        connectTimeout = 2000; readTimeout = 2000
-                    }
-                    val response = try { conn.readTextResponse() } finally { conn.disconnect() }
-                    if (response.code == 200 && isGenieApiServiceReady(response.body)) {
-                        ready = true
-                    }
-                } catch (_: Exception) {}
-
-                // Step 3: Start embedded service if needed
-                if (!ready) {
-                    if (!hasModelDirectoryAccess()) {
-                        withContext(Dispatchers.Main) {
-                            loadingText = "需要授权访问 $MODEL_ROOT 以启动推理服务"
-                            needsModelDirectoryAccess = true
-                        }
-                        return@launch
-                    }
-
-                    try {
-                        val intent = Intent(context, GenieHttpService::class.java)
-                        intent.putExtra("model_dir", MODEL_ROOT)
-                        context.startForegroundService(intent)
-                        Log.d(TAG, "Started embedded GenieHttpService")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Embedded service failed", e)
-                    }
-
-                    // Poll with NPU loading counter
-                    withContext(Dispatchers.Main) { npuLoading = true }
-                    for (i in 1..180) {
-                        try {
-                            val conn = (java.net.URL("http://127.0.0.1:8910/v1/models").openConnection() as java.net.HttpURLConnection).apply {
-                                connectTimeout = 2000; readTimeout = 2000
-                            }
-                            val code = conn.responseCode
-                            val body = conn.inputStream.bufferedReader().readText()
-                            conn.disconnect()
-                            if (code == 200 && isGenieApiServiceReady(body)) {
-                                Log.d(TAG, "Service ready after ${i}s")
-                                ready = true
-                                break
-                            }
-                        } catch (_: Exception) {}
-                        Thread.sleep(1000)
-                        withContext(Dispatchers.Main) { npuLoadingSeconds = i }
-                    }
-                }
-
-                if (ready) {
-                    withContext(Dispatchers.Main) {
-                        npuLoading = false
-                        genieReady = true
-                    }
-                } else {
-                    withContext(Dispatchers.Main) {
-                        npuLoading = false
-                        loadingText = "推理服务启动超时"
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Init failed", e)
-                withContext(Dispatchers.Main) { loadingText = "初始化失败: ${e.message}" }
-            } finally {
-                withContext(Dispatchers.Main) { isCheckingService = false }
-            }
-        }
-    }
 
     fun refreshGenieServiceStatusWithDemo() {
         if (isCheckingService) return

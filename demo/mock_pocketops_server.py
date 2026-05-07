@@ -35,7 +35,7 @@ KNOWLEDGE_GRAPH_RELATIVE_PATH = Path(
     "Android/src/app/src/main/assets/maintenance/knowledge_graph.json"
 )
 DEFAULT_SYNC_VERSION = "2026-05-06.demo.1"
-DEFAULT_MIN_SUPPORTED_APP_VERSION = "1.0.0"
+DEFAULT_MIN_SUPPORTED_APP_VERSION = "4.8"
 DEFAULT_DEMO_USERNAME = "engineer"
 DEFAULT_DEMO_PASSWORD = "PocketOps@2026"
 DEFAULT_TOKEN_TTL_SECONDS = 8 * 60 * 60
@@ -147,8 +147,8 @@ def iter_knowledge_graph_candidates() -> Sequence[Path]:
         ROOT.parent / KNOWLEDGE_GRAPH_RELATIVE_PATH,
     ]
 
-    # Probe sibling project folders without assuming the Android repo keeps a
-    # specific release-style directory name such as gallery-1.0.11.
+    # Probe sibling project folders without assuming a specific release-style
+    # Android repo directory name.
     workspace_root = ROOT.parent
     try:
         siblings = sorted(path for path in workspace_root.iterdir() if path.is_dir())

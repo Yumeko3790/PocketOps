@@ -16,38 +16,24 @@
 
 plugins {
   alias(libs.plugins.android.application)
-  // Note: set apply to true to enable google-services (requires google-services.json).
-  alias(libs.plugins.google.services) apply false
   alias(libs.plugins.kotlin.android)
   alias(libs.plugins.kotlin.compose)
-  alias(libs.plugins.kotlin.serialization)
-  alias(libs.plugins.protobuf)
-  alias(libs.plugins.hilt.application)
-  alias(libs.plugins.oss.licenses)
-  alias(libs.plugins.ksp)
-  kotlin("kapt")
 }
 
 android {
-  namespace = "com.google.ai.edge.gallery"
+  namespace = "com.pocketops.app"
   compileSdk = 35
 
   defaultConfig {
     applicationId = "com.pocketops.app"
     minSdk = 31
     targetSdk = 35
-    versionCode = 1
-    versionName = "1.0.0"
+    versionCode = 48
+    versionName = "4.8"
 
     ndk {
       abiFilters += "arm64-v8a"
     }
-
-    // Needed for HuggingFace auth workflows.
-    // Use the scheme of the "Redirect URLs" in HuggingFace app.
-    manifestPlaceholders["appAuthRedirectScheme"] =
-        "REPLACE_WITH_YOUR_REDIRECT_SCHEME_IN_HUGGINGFACE_APP"
-    manifestPlaceholders["applicationName"] = "com.google.ai.edge.gallery.GalleryApplication"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -71,20 +57,10 @@ android {
     compose = true
     buildConfig = true
   }
-  externalNativeBuild {
-    cmake {
-      path = file("src/main/cpp/CMakeLists.txt")
-      version = "3.22.1"
-    }
-  }
 }
 
 dependencies {
   implementation(files("libs/qtld-release.aar"))
-  implementation("org.tensorflow:tensorflow-lite:2.14.0")
-  implementation("org.pytorch:pytorch_android:2.1.0")
-  implementation("org.pytorch:pytorch_android_torchvision:2.1.0")
-  implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
   implementation(libs.androidx.core.ktx)
   implementation(libs.androidx.lifecycle.runtime.ktx)
   implementation(libs.androidx.activity.compose)
@@ -93,51 +69,14 @@ dependencies {
   implementation(libs.androidx.ui.graphics)
   implementation(libs.androidx.ui.tooling.preview)
   implementation(libs.androidx.material3)
-  implementation(libs.androidx.compose.navigation)
-  implementation(libs.kotlinx.serialization.json)
-  implementation(libs.kotlin.reflect)
   implementation(libs.material.icon.extended)
-  implementation(libs.androidx.work.runtime)
-  implementation(libs.androidx.datastore)
   implementation(libs.com.google.code.gson)
-  implementation(libs.androidx.lifecycle.process)
   implementation(libs.androidx.security.crypto)
-  implementation(libs.androidx.webkit)
-  implementation(libs.litertlm)
-  implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
-  implementation(libs.commonmark)
-  implementation(libs.richtext)
-  implementation(libs.tflite)
-  implementation(libs.tflite.gpu)
-  implementation(libs.tflite.support)
-  implementation(libs.camerax.core)
-  implementation(libs.camerax.camera2)
-  implementation(libs.camerax.lifecycle)
-  implementation(libs.camerax.view)
-  implementation(libs.openid.appauth)
-  implementation(libs.androidx.splashscreen)
-  implementation(libs.protobuf.javalite)
-  implementation(libs.hilt.android)
-  implementation(libs.hilt.navigation.compose)
-  implementation(libs.play.services.oss.licenses)
-  implementation(platform(libs.firebase.bom))
-  implementation(libs.firebase.analytics)
-  implementation(libs.firebase.messaging)
-  implementation(libs.androidx.exifinterface)
-  implementation(libs.moshi.kotlin)
-  kapt(libs.hilt.android.compiler)
   testImplementation(libs.junit)
   androidTestImplementation(libs.androidx.junit)
   androidTestImplementation(libs.androidx.espresso.core)
   androidTestImplementation(platform(libs.androidx.compose.bom))
   androidTestImplementation(libs.androidx.ui.test.junit4)
-  androidTestImplementation(libs.hilt.android.testing)
   debugImplementation(libs.androidx.ui.tooling)
   debugImplementation(libs.androidx.ui.test.manifest)
-  ksp(libs.moshi.kotlin.codegen)
-}
-
-protobuf {
-  protoc { artifact = "com.google.protobuf:protoc:4.26.1" }
-  generateProtoTasks { all().forEach { it.plugins { create("java") { option("lite") } } } }
 }

@@ -7,7 +7,7 @@
 1. 启动阶段的远程同步
    - 拉取本次同步版本信息
    - 获取需要下载的核心资源清单
-   - 校验资源大小、哈希、版本和落盘路径
+   - 校验资源大小、哈希和落盘路径，并保留版本用于展示和追踪
 2. 诊断阶段的资料获取
    - 根据设备、症状、工单等上下文返回可下载资料
    - 支持 PDF、ZIP、JSON 等附件类型
@@ -21,10 +21,12 @@
 客户端会：
 
 1. 请求远程 `manifest`
-2. 根据 `resources` 判断本地是否已有同版本文件
-3. 只下载缺失或版本变化的资源
-4. 校验 `sha256`
-5. 对 `requiredAtBoot=true` 的资源，完成后再继续主流程
+2. 从 `resources` 中选择 `knowledge_graph`，没有时选择第一个
+   `requiredAtBoot=true` 的资源
+3. 如果本地已有文件且 `sha256` 匹配，直接复用
+4. 否则下载资源并校验大小和 `sha256`
+5. 对 `requiredAtBoot=true` 的资源，完成后再继续主流程；远程同步失败时，
+   客户端会先尝试使用上次缓存，再回退到 APK 内置知识图谱
 
 ### 诊断阶段
 
@@ -75,7 +77,7 @@
 
 ```http
 Authorization: Bearer <token>
-X-App-Version: 1.0.11
+X-App-Version: 4.8
 X-Device-Id: <uuid>
 X-Tenant-Id: <tenantId>
 X-Site-Id: <siteId>
@@ -101,7 +103,7 @@ X-Site-Id: <siteId>
 ### 6.1 定义
 
 ```http
-GET /api/pocketops/bootstrap/manifest?tenantId=t1&siteId=s1&appVersion=1.0.11
+GET /api/pocketops/bootstrap/manifest?tenantId=t1&siteId=s1&appVersion=4.8
 ```
 
 ### 6.2 作用
@@ -118,7 +120,7 @@ GET /api/pocketops/bootstrap/manifest?tenantId=t1&siteId=s1&appVersion=1.0.11
 ```json
 {
   "syncVersion": "2026-05-06.demo.1",
-  "minSupportedAppVersion": "1.0.0",
+  "minSupportedAppVersion": "4.8",
   "generatedAt": "2026-05-06T08:00:00Z",
   "summary": {
     "equipmentCount": 32,
@@ -169,6 +171,11 @@ GET /api/pocketops/bootstrap/manifest?tenantId=t1&siteId=s1&appVersion=1.0.11
   - 启动页逐条展示的同步进度文案
 - `resources`
   - 客户端真正要下载的资源清单
+- `resources[].version`
+  - 资源版本元数据，用于展示、审计和服务端排查；当前客户端是否复用文件
+    以 `sha256` 为准
+- `resources[].sizeBytes` / `resources[].sha256`
+  - 下载后的完整性校验依据
 - `requiredAtBoot`
   - `true` 表示主流程前必须完成下载
 - `localPath`

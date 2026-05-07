@@ -357,7 +357,7 @@ suspend fun fetchDemoManifest(baseUrl: String, accessToken: String): DemoManifes
     check(normalized.isNotBlank()) { "\u7535\u8111\u670d\u52a1\u5730\u5740\u4e0d\u80fd\u4e3a\u7a7a" }
 
     val response = sendDemoJsonRequest(
-        url = "$normalized/api/pocketops/bootstrap/manifest?tenantId=demo&siteId=demo&appVersion=1.0.11",
+        url = "$normalized/api/pocketops/bootstrap/manifest?tenantId=demo&siteId=demo&appVersion=${BuildConfig.VERSION_NAME}",
         method = "GET",
         bearerToken = accessToken,
     )

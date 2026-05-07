@@ -19,17 +19,14 @@ The default production entry points are:
 - embedded foreground service:
   `Android/src/app/src/main/java/com/pocketops/app/GenieHttpService.kt`
 
-The retained Gallery shell is still present at:
-
-- `Android/src/app/src/main/java/com/google/ai/edge/gallery/MainActivity.kt`
-
-That retained shell is not the default launcher path.
+The old Gallery shell has been removed from the Android source tree. The
+PocketOps launcher path above is the only production app entry point.
 
 ## Build configuration snapshot
 
 - application id: `com.pocketops.app`
-- namespace: `com.google.ai.edge.gallery`
-- version: `1.0.0`
+- namespace: `com.pocketops.app`
+- version: `4.8`
 - minSdk / targetSdk / compileSdk: `31` / `35` / `35`
 - ABI: `arm64-v8a`
 
@@ -56,7 +53,7 @@ from inside the app.
   `Android/src/app/src/main/java/com/pocketops/app/PocketOpsActivity.kt`
 - embedded native service wrapper:
   `Android/src/app/src/main/java/com/pocketops/app/GenieHttpService.kt`
-- retained knowledge graph asset:
+- knowledge graph asset:
   `Android/src/app/src/main/assets/maintenance/knowledge_graph.json`
 
 ## Command-line build
