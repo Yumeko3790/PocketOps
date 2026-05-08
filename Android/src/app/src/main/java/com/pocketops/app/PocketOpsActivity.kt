@@ -1687,6 +1687,13 @@ fun PocketOpsApp(
                 }
             }
         val userMessageText = if (isVideoRequest) "视频诊断：$userText" else userText
+        val explicitEquipmentMentionForTurn = extractExplicitEquipmentMention(userText)
+        val explicitUnknownEquipmentForTurn =
+            explicitEquipmentMentionForTurn != null && knowledgeGraph.findEquipment(userText).isEmpty()
+
+        if (explicitUnknownEquipmentForTurn) {
+            clearDiagnosisContextAfterWorkOrder()
+        }
 
         val safeBitmap = bitmap?.let {
             if (it.config == Bitmap.Config.HARDWARE) it.copy(Bitmap.Config.ARGB_8888, false) else it
@@ -1694,7 +1701,7 @@ fun PocketOpsApp(
 
         messages.add(PocketMessage(text = userMessageText, isUser = true, bitmap = safeBitmap))
         val userMessageIndex = messages.lastIndex
-        val equipmentContextForTurn = activeEquipmentContext
+        val equipmentContextForTurn = if (explicitUnknownEquipmentForTurn) null else activeEquipmentContext
         isGenerating = true
 
         scope.launch(Dispatchers.IO) {
@@ -1867,6 +1874,26 @@ fun PocketOpsApp(
                     return@launch
                 }
 
+                explicitEquipmentMentionForTurn?.takeIf { explicitUnknownEquipmentForTurn }?.let { equipmentMention ->
+                    buildUnknownEquipmentSymptomReport(
+                        equipmentMention = equipmentMention,
+                        userInput = userText,
+                        graph = knowledgeGraph,
+                    )?.let { content ->
+                        withContext(Dispatchers.Main) {
+                            messages.add(PocketMessage(text = content, isUser = false))
+                            activeEquipmentContext = null
+                            latestVisualContextText = ""
+                            latestVisualEquipmentContext = null
+                            visualLookupScopeActive = false
+                        }
+                        conversationHistory.add("user" to userText)
+                        conversationHistory.add("assistant" to content)
+                        appendHistory(userText, content)
+                        return@launch
+                    }
+                }
+
                 // LLM query via HTTP (stream)
                 withContext(Dispatchers.Main) { messages.add(PocketMessage(text = "", isUser = false)) }
 
@@ -1874,7 +1901,16 @@ fun PocketOpsApp(
                     buildPartialRAGContext(userText, knowledgeGraph)
                         ?: buildPartialRAGContext(contextualRetrievalText, knowledgeGraph)
                         ?: buildPartialRAGContext(retrievalText, knowledgeGraph)
-                val sysPrompt = if (ragContext != null) SYSTEM_PROMPT + "\n\n" + ragContext else SYSTEM_PROMPT
+                val explicitUnknownEquipmentGuard =
+                    explicitEquipmentMentionForTurn?.takeIf { explicitUnknownEquipmentForTurn }?.let { equipmentMention ->
+                        "\n\n重要约束：用户本轮明确提到“$equipmentMention”，但知识库没有匹配到该设备。严禁沿用上一轮图片、视频或工单中的其他设备编号，尤其不要输出3号叉车等旧设备。equipment字段必须填写“$equipmentMention（知识库未收录）”，并提示需要补充设备档案；原因、备件和步骤只能作为通用参考。"
+                    }.orEmpty()
+                val sysPrompt =
+                    if (ragContext != null) {
+                        SYSTEM_PROMPT + "\n\n" + ragContext + explicitUnknownEquipmentGuard
+                    } else {
+                        SYSTEM_PROMPT + explicitUnknownEquipmentGuard
+                    }
 
                 val httpMessages = org.json.JSONArray().apply {
                     put(org.json.JSONObject().put("role", "system").put("content", "你是工业叉车诊断助手，请用JSON格式回答。"))
@@ -2206,7 +2242,10 @@ fun PocketOpsApp(
                             items(messages) { msg ->
                                 MessageBubble(
                                     msg,
-                                    onGenerateWorkOrder = { selectedWorkOrderMessage = msg },
+                                    onGenerateWorkOrder = {
+                                        selectedWorkOrderMessage = msg
+                                        clearDiagnosisContextAfterWorkOrder()
+                                    },
                                     onShowGraph = { if (msg.graphJson.isNotEmpty()) selectedGraphJson = msg.graphJson },
                                 )
                             }
@@ -4334,6 +4373,85 @@ private fun isEquipmentLookupQuestion(text: String): Boolean {
     return asksLookup && !hasSymptom
 }
 
+private fun extractExplicitEquipmentMention(text: String): String? {
+    val normalized = text.trim()
+    if (normalized.isBlank()) return null
+    val patterns =
+        listOf(
+            Regex("""\d+\s*号\s*叉车"""),
+            Regex("""叉车\s*\d+\s*号"""),
+            Regex("""[A-Za-z0-9-]{2,}\s*(?:叉车|设备)"""),
+        )
+    return patterns
+        .asSequence()
+        .mapNotNull { pattern -> pattern.find(normalized)?.value }
+        .map { it.replace(Regex("""\s+"""), "") }
+        .firstOrNull()
+}
+
+private fun buildUnknownEquipmentSymptomReport(
+    equipmentMention: String,
+    userInput: String,
+    graph: MaintenanceKnowledgeGraph,
+): String? {
+    val matchedKeyword = SYMPTOM_KEYWORDS.firstOrNull { userInput.contains(it) } ?: return null
+    val symptom = findReferenceSymptom(matchedKeyword, graph) ?: return null
+    val sub = graph.traverseFromNode(symptom.id, maxHops = 4)
+    val causes = sub.nodes
+        .filter { it.type == NodeType.ROOT_CAUSE }
+        .sortedByDescending { it.properties["probability"]?.toFloatOrNull() ?: 0f }
+    val parts = sub.nodes.filter { it.type == NodeType.PART }
+    val steps = sub.nodes
+        .filter { it.type == NodeType.REPAIR_STEP }
+        .sortedBy { it.properties["order"]?.toIntOrNull() ?: 99 }
+
+    val json = org.json.JSONObject().apply {
+        put("equipment", "$equipmentMention（知识库未收录）")
+        put("location", "")
+        put("symptom", matchedKeyword)
+        put("severity", symptom.properties["severity"].orEmpty())
+        put(
+            "causes",
+            org.json.JSONArray().apply {
+                causes.forEach { cause ->
+                    put(
+                        org.json.JSONObject()
+                            .put("name", cause.label)
+                            .put("probability", ((cause.properties["probability"]?.toFloatOrNull() ?: 0f) * 100).toInt()),
+                    )
+                }
+            },
+        )
+        put(
+            "parts",
+            org.json.JSONArray().apply {
+                parts.forEach { part ->
+                    put(
+                        org.json.JSONObject()
+                            .put("name", part.label)
+                            .put("spec", part.properties["spec"].orEmpty())
+                            .put("stock", part.properties["stock"].orEmpty()),
+                    )
+                }
+            },
+        )
+        put(
+            "steps",
+            org.json.JSONArray().apply {
+                steps.forEach { step ->
+                    put(
+                        org.json.JSONObject()
+                            .put("title", step.label)
+                            .put("duration", step.properties["duration"].orEmpty())
+                            .put("tool", step.properties["tool"].orEmpty()),
+                    )
+                }
+            },
+        )
+    }
+    return json.toString()
+}
+
 private fun buildGraphRAGReport(
     userInput: String,
     graph: MaintenanceKnowledgeGraph,
@@ -4430,19 +4548,25 @@ private fun buildPartialRAGContext(userInput: String, graph: MaintenanceKnowledg
 
     // Try to find any matching equipment
     val equipmentNodes = graph.findEquipment(userInput)
+    val explicitEquipment = equipmentNodes.firstOrNull()
+    val explicitEquipmentMention = extractExplicitEquipmentMention(userInput)
 
     // Try symptom keywords across all equipment
     val matchedKeyword = SYMPTOM_KEYWORDS.firstOrNull { userInput.contains(it) }
 
     if (matchedKeyword != null) {
         sb.appendLine("用户描述的症状关键词：$matchedKeyword")
-        if (equipmentNodes.isEmpty()) {
-            sb.appendLine("注意：用户提到的设备不在知识库中，请在回答中使用用户提到的设备编号，以下仅作为参考数据。")
+        if (explicitEquipment == null && explicitEquipmentMention != null) {
+            sb.appendLine("用户本轮指定了设备“$explicitEquipmentMention”，但该设备不在知识库中。不要沿用上一轮图片、视频或工单中的设备编号；equipment字段请填写“$explicitEquipmentMention（知识库未收录）”。以下仅作为该症状的通用维修知识参考。")
+        } else if (explicitEquipment == null) {
+            sb.appendLine("用户未指定具体设备编号。不要沿用上一轮图片或视频识别到的设备，也不要臆测设备编号；equipment字段请填写“待确认设备”，并提示用户补充设备编号或重新上传设备图片。以下仅作为该症状的通用维修知识参考。")
         }
 
-        // Search all equipment for this symptom
-        val allEquipment = graph.findEquipment("叉车")
-        for (eq in allEquipment) {
+        // Search matching equipment for this symptom. Without an explicit equipment id,
+        // use only generic symptom knowledge so a previous visual lookup cannot keep
+        // locking later symptom-only turns to the same forklift.
+        val candidateEquipment = explicitEquipment?.let { listOf(it) } ?: graph.findEquipment("叉车")
+        for (eq in candidateEquipment) {
             val symptoms = graph.findSymptoms(eq.id, matchedKeyword)
             if (symptoms.isNotEmpty()) {
                 val symptom = symptoms.first()
@@ -4452,7 +4576,11 @@ private fun buildPartialRAGContext(userInput: String, graph: MaintenanceKnowledg
                 val steps = sub.nodes.filter { it.type == NodeType.REPAIR_STEP }
                 val personnel = sub.nodes.filter { it.type == NodeType.PERSONNEL }
 
-                sb.appendLine("\n[以下为知识库参考数据，来源设备：${eq.label}]")
+                if (explicitEquipment != null) {
+                    sb.appendLine("\n[以下为知识库参考数据，来源设备：${eq.label}]")
+                } else {
+                    sb.appendLine("\n[以下为通用症状参考数据，不代表已锁定到某一台叉车]")
+                }
                 sb.appendLine("故障症状：${symptom.label}，严重程度：${symptom.properties["severity"]}")
                 sb.appendLine("可能原因：${causes.joinToString("、") { "${it.label}(${((it.properties["probability"]?.toFloatOrNull() ?: 0f) * 100).toInt()}%)" }}")
                 sb.appendLine("所需备件：${parts.joinToString("、") { "${it.label}(${it.properties["spec"]})" }}")
@@ -4460,7 +4588,7 @@ private fun buildPartialRAGContext(userInput: String, graph: MaintenanceKnowledg
                 sb.appendLine("推荐人员：${personnel.joinToString("、") { "${it.label}(${it.properties["skill"]}专家)" }}")
 
                 val workOrders = graph.matchWorkOrders(symptom.id)
-                if (workOrders.isNotEmpty()) {
+                if (explicitEquipment != null && workOrders.isNotEmpty()) {
                     sb.appendLine("相似工单：${workOrders.joinToString("、") { "${it.label}(${it.properties["date"]})" }}")
                 }
                 break
