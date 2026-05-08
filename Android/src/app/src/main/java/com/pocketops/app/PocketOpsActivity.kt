@@ -156,7 +156,7 @@ private fun runtimeStatusColor(genieReady: Boolean, remoteState: RemoteBootstrap
 private const val SYSTEM_PROMPT = """你是工业叉车诊断助手。请严格按JSON格式输出：{"equipment":"设备","symptom":"症状","severity":"高/中/低","causes":[{"name":"原因","probability":80}],"parts":[{"name":"备件","spec":"规格","stock":"充足"}],"steps":[{"title":"步骤","duration":"耗时","tool":"工具"}]}。只输出JSON，不要其他文字。"""
 
 private const val IMAGE_SYSTEM_PROMPT = """你是PocketOps工业车辆诊断助手，擅长识别工业设备图片。请仔细观察图片内容，只能使用简体中文回答用户的问题。回答要专业、详细、准确，包括你在图片中看到的所有相关信息（文字、数字、标签、设备状态、部件名称等）。除图片中原始英文标签外，不要输出英文句子。"""
-private const val VIDEO_SYSTEM_PROMPT = """你是PocketOps工业车辆诊断助手，当前收到的是从同一段工业设备视频中抽取的多帧拼图。请结合时间顺序综合分析设备状态、异常动作、故障线索、仪表/标签信息和可能的风险点，只能使用简体中文直接回答。除画面中的原始英文标签外，不要输出英文句子。"""
+private const val VIDEO_SYSTEM_PROMPT = """你是PocketOps工业车辆诊断助手，当前收到的是从同一段工业设备视频中抽取的多帧拼图。请结合时间顺序综合分析设备状态、异常动作、故障线索、仪表/标签信息和可能的风险点。必须只用简体中文直接回答，不要输出英文分析句子。画面中的原始英文标签、设备编号、故障码和单位可以保留原文，但需要用中文解释其含义。"""
 
 private val SYMPTOM_KEYWORDS = listOf("举升缓慢", "无法启动", "转向沉重", "发动机过热", "异响", "液压油泄漏", "制动失灵", "门架倾斜")
 
@@ -366,6 +366,66 @@ private fun buildHttpErrorMessage(prefix: String, code: Int, body: String): Stri
         "$prefix\uff08\u72b6\u6001\u7801 $code\uff09"
     } else {
         "$prefix\uff08\u72b6\u6001\u7801 $code\uff09\uff1a$detail"
+    }
+}
+
+private fun isMostlyEnglishAnswer(text: String): Boolean {
+    val englishLetters = text.count { it in 'A'..'Z' || it in 'a'..'z' }
+    val chineseChars = text.count { it in '\u4e00'..'\u9fff' }
+    return englishLetters >= 40 && englishLetters > chineseChars * 2
+}
+
+private fun rewriteVlmAnswerToChinese(rawText: String): String {
+    if (!isMostlyEnglishAnswer(rawText)) return rawText
+    return try {
+        clearGenieChatState()
+        val reqJson = org.json.JSONObject().apply {
+            put("model", "qwen2.5vl-3b-8850-2.42")
+            put("stream", false)
+            put("size", 4096)
+            put("temp", 0.0)
+            put("top_k", 1)
+            put("top_p", 1.0)
+            put("messages", org.json.JSONArray().apply {
+                put(
+                    org.json.JSONObject()
+                        .put("role", "system")
+                        .put("content", "你是专业的工业车辆诊断报告改写助手。只输出简体中文，不要补充原文没有的信息。")
+                )
+                put(
+                    org.json.JSONObject()
+                        .put("role", "user")
+                        .put(
+                            "content",
+                            "请把下面的视频诊断结果改写为简体中文。保留设备编号、故障码、型号、单位和画面中原始英文标签，但用中文说明含义；不要输出英文分析句子。\n\n$rawText",
+                        )
+                )
+            })
+        }
+        val conn = (java.net.URL("http://127.0.0.1:8910/v1/chat/completions").openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json")
+            doOutput = true
+            connectTimeout = 10000
+            readTimeout = 120000
+        }
+        conn.outputStream.use { it.write(reqJson.toString().toByteArray(Charsets.UTF_8)) }
+        val response = try { conn.readTextResponse() } finally { conn.disconnect() }
+        if (response.code !in 200..299) {
+            Log.w(TAG, buildHttpErrorMessage("视频结果中文改写失败", response.code, response.body))
+            rawText
+        } else {
+            org.json.JSONObject(response.body)
+                .getJSONArray("choices")
+                .getJSONObject(0)
+                .getJSONObject("message")
+                .getString("content")
+                .takeIf { it.isNotBlank() }
+                ?: rawText
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "Video answer Chinese rewrite failed", e)
+        rawText
     }
 }
 
@@ -1657,7 +1717,7 @@ fun PocketOpsApp(
                     visualBitmap = extractedFrames.contactSheet
                     visualSystemPrompt = VIDEO_SYSTEM_PROMPT
                     visualQuestion =
-                        "这是从同一段设备视频中提取的${extractedFrames.frameCount}帧关键帧拼图，视频时长约${formatVideoTimestamp(extractedFrames.durationMs)}。请结合全部画面进行诊断。$userText"
+                        "这是从同一段设备视频中提取的${extractedFrames.frameCount}帧关键帧拼图，视频时长约${formatVideoTimestamp(extractedFrames.durationMs)}。请结合全部画面进行诊断。回答必须全部使用简体中文；不要用英文描述画面、结论或建议。请按“画面观察、异常线索、可能原因、处理建议”的中文结构回答。用户问题：$userText"
                     visualHistoryLabel = "[用户发送了视频抽帧] $userText"
                     visualErrorPrefix = "视频抽帧推理失败"
 
@@ -1719,8 +1779,9 @@ fun PocketOpsApp(
                         }
 
                         val respJson = org.json.JSONObject(response.body)
-                        val content = respJson.getJSONArray("choices").getJSONObject(0)
+                        val rawContent = respJson.getJSONArray("choices").getJSONObject(0)
                             .getJSONObject("message").getString("content")
+                        val content = if (videoUri != null) rewriteVlmAnswerToChinese(rawContent) else rawContent
 
                         withContext(Dispatchers.Main) {
                             val idx = messages.size - 1
