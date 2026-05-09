@@ -2,8 +2,10 @@
 """PocketOps demo mock server.
 
 Serves:
+- POST /api/pocketops/auth/login
 - GET  /api/pocketops/bootstrap/manifest
 - POST /api/pocketops/materials/query
+- POST /api/pocketops/work-orders/submit
 - GET/HEAD /files/...
 
 The server reads the real bundled knowledge graph from the Android assets
@@ -56,6 +58,7 @@ class FileAsset:
 ASSETS: Dict[str, FileAsset] = {}
 GRAPH_STATS: Dict[str, object] = {}
 AUTH_SESSIONS: Dict[str, Dict[str, object]] = {}
+SUBMITTED_WORK_ORDERS: Dict[str, Dict[str, object]] = {}
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -420,6 +423,30 @@ def build_materials(base_url: str, payload: Dict[str, object]) -> Dict[str, obje
     }
 
 
+def store_submitted_work_order(payload: Dict[str, object]) -> Dict[str, object]:
+    work_order_id = str(payload.get("workOrderId") or "")
+    client_submission_id = str(payload.get("clientSubmissionId") or "")
+    if not work_order_id:
+        raise ValueError("missing workOrderId")
+    if not client_submission_id:
+        raise ValueError("missing clientSubmissionId")
+
+    server_id = f"server-{work_order_id}"
+    submitted_at = datetime.now(timezone.utc).isoformat()
+    SUBMITTED_WORK_ORDERS[client_submission_id] = {
+        "serverWorkOrderId": server_id,
+        "submittedAt": submitted_at,
+        "payload": payload,
+    }
+    return {
+        "accepted": True,
+        "serverWorkOrderId": server_id,
+        "clientSubmissionId": client_submission_id,
+        "submittedAt": submitted_at,
+        "queuedCount": len(SUBMITTED_WORK_ORDERS),
+    }
+
+
 def authenticate_demo_user(
     username: str,
     password: str,
@@ -502,20 +529,37 @@ class PocketOpsDemoHandler(BaseHTTPRequestHandler):
             self.handle_login()
             return
 
-        if parsed.path != "/api/pocketops/materials/query":
-            self.send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
+        if parsed.path == "/api/pocketops/materials/query":
+            if not self.require_auth():
+                return
+
+            try:
+                payload = parse_json_body(self)
+            except json.JSONDecodeError as exc:
+                self.send_json({"error": f"invalid_json: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            self.send_json(build_materials(self.base_url(), payload))
             return
 
-        if not self.require_auth():
+        if parsed.path == "/api/pocketops/work-orders/submit":
+            if not self.require_auth():
+                return
+
+            try:
+                payload = parse_json_body(self)
+                result = store_submitted_work_order(payload)
+            except json.JSONDecodeError as exc:
+                self.send_json({"error": f"invalid_json: {exc}"}, status=HTTPStatus.BAD_REQUEST)
+                return
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            self.send_json(result, status=HTTPStatus.CREATED)
             return
 
-        try:
-            payload = parse_json_body(self)
-        except json.JSONDecodeError as exc:
-            self.send_json({"error": f"invalid_json: {exc}"}, status=HTTPStatus.BAD_REQUEST)
-            return
-
-        self.send_json(build_materials(self.base_url(), payload))
+        self.send_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
     def handle_login(self) -> None:
         try:

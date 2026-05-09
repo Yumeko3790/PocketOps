@@ -497,6 +497,26 @@ suspend fun queryDemoMaterials(
     return Gson().fromJson(response.body, DemoMaterialsResponse::class.java).materials
 }
 
+suspend fun submitDemoWorkOrder(
+    baseUrl: String,
+    accessToken: String,
+    payloadJson: String,
+) {
+    val normalized = normalizeDemoServerBaseUrl(baseUrl)
+    check(normalized.isNotBlank()) { "电脑服务地址不能为空" }
+    check(accessToken.isNotBlank()) { "当前没有可用登录凭证，工单已保存在本机待提交" }
+
+    val response = sendDemoJsonRequest(
+        url = "$normalized/api/pocketops/work-orders/submit",
+        method = "POST",
+        body = payloadJson,
+        bearerToken = accessToken,
+    )
+    if (response.code !in 200..299) {
+        throw IllegalStateException(buildDemoHttpError("提交工单失败", response.code, response.body))
+    }
+}
+
 suspend fun downloadDemoMaterial(context: Context, material: DemoMaterial, accessToken: String): File {
     val targetDir = File(context.cacheDir, DEMO_MATERIALS_DIR).apply { mkdirs() }
     val extension = guessDemoExtension(material)

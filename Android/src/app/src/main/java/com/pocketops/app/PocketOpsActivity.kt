@@ -772,6 +772,16 @@ private data class WorkOrderDocumentData(
     val relatedWorkOrders: List<String>,
 )
 
+private data class QueuedWorkOrderSubmission(
+    val localId: String,
+    val workOrderId: String,
+    val createdAt: String,
+    val queuedAt: Long,
+    val workOrder: WorkOrderDocumentData,
+    val attemptCount: Int = 0,
+    val lastError: String = "",
+)
+
 private fun formatGraphWorkOrders(workOrders: List<GraphNode>): List<String> {
     return workOrders.map { workOrder ->
         val date = workOrder.properties["date"].orEmpty()
@@ -933,6 +943,149 @@ private fun buildWorkOrderRecordText(
     return details.toString().trim()
 }
 
+private const val WORK_ORDER_QUEUE_FILE = "work_order_submit_queue.json"
+private val workOrderQueueGson = Gson()
+
+private fun loadQueuedWorkOrders(context: Context): MutableList<QueuedWorkOrderSubmission> {
+    return try {
+        val file = File(context.filesDir, WORK_ORDER_QUEUE_FILE)
+        if (!file.exists()) return mutableListOf()
+        val type = object : TypeToken<List<QueuedWorkOrderSubmission>>() {}.type
+        workOrderQueueGson.fromJson<List<QueuedWorkOrderSubmission>>(file.readText(), type)?.toMutableList()
+            ?: mutableListOf()
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to load queued work orders", e)
+        mutableListOf()
+    }
+}
+
+private fun saveQueuedWorkOrders(context: Context, queue: List<QueuedWorkOrderSubmission>) {
+    try {
+        File(context.filesDir, WORK_ORDER_QUEUE_FILE).writeText(workOrderQueueGson.toJson(queue))
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to save queued work orders", e)
+    }
+}
+
+private fun clearQueuedWorkOrders(context: Context, queue: MutableList<QueuedWorkOrderSubmission>) {
+    queue.clear()
+    try {
+        File(context.filesDir, WORK_ORDER_QUEUE_FILE).delete()
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to clear queued work orders", e)
+    }
+}
+
+private fun enqueueWorkOrderSubmission(
+    context: Context,
+    queue: MutableList<QueuedWorkOrderSubmission>,
+    workOrderId: String,
+    createdAt: String,
+    workOrder: WorkOrderDocumentData,
+): QueuedWorkOrderSubmission {
+    queue.removeAll { it.workOrderId == workOrderId }
+    val item = QueuedWorkOrderSubmission(
+        localId = "local-${System.currentTimeMillis()}-${queue.size + 1}",
+        workOrderId = workOrderId,
+        createdAt = createdAt,
+        queuedAt = System.currentTimeMillis(),
+        workOrder = workOrder,
+    )
+    queue.add(item)
+    saveQueuedWorkOrders(context, queue)
+    return item
+}
+
+private suspend fun flushQueuedWorkOrders(
+    context: Context,
+    queue: MutableList<QueuedWorkOrderSubmission>,
+    baseUrl: String,
+    accessToken: String,
+    onQueueChanged: () -> Unit = {},
+): Pair<Int, String?> {
+    val normalized = normalizeDemoServerBaseUrl(baseUrl)
+    if (normalized.isBlank()) {
+        return 0 to "未配置电脑服务"
+    }
+    if (accessToken.isBlank()) {
+        return 0 to "当前为离线登录，暂无可用提交凭证"
+    }
+
+    var submittedCount = 0
+    var lastError: String? = null
+    val snapshot = queue.toList()
+    for (item in snapshot) {
+        try {
+            submitQueuedWorkOrder(normalized, accessToken, item)
+            queue.removeAll { it.localId == item.localId }
+            submittedCount += 1
+            saveQueuedWorkOrders(context, queue)
+            onQueueChanged()
+        } catch (e: Exception) {
+            lastError = e.message ?: "工单提交失败"
+            val index = queue.indexOfFirst { it.localId == item.localId }
+            if (index >= 0) {
+                queue[index] = queue[index].copy(
+                    attemptCount = queue[index].attemptCount + 1,
+                    lastError = lastError,
+                )
+                saveQueuedWorkOrders(context, queue)
+                onQueueChanged()
+            }
+            break
+        }
+    }
+    return submittedCount to lastError
+}
+
+private suspend fun submitQueuedWorkOrder(
+    normalizedBaseUrl: String,
+    accessToken: String,
+    item: QueuedWorkOrderSubmission,
+) {
+    submitDemoWorkOrder(
+        baseUrl = normalizedBaseUrl,
+        accessToken = accessToken,
+        payloadJson = item.toSubmitPayloadJson(),
+    )
+}
+
+private fun QueuedWorkOrderSubmission.toSubmitPayloadJson(): String {
+    return org.json.JSONObject().apply {
+        put("tenantId", "demo")
+        put("siteId", "demo")
+        put("clientSubmissionId", localId)
+        put("workOrderId", workOrderId)
+        put("createdAt", createdAt)
+        put("queuedAt", queuedAt)
+        put("attemptCount", attemptCount)
+        put("source", "android_offline_queue")
+        put("workOrder", workOrder.toJsonObject())
+    }.toString()
+}
+
+private fun WorkOrderDocumentData.toJsonObject(): org.json.JSONObject {
+    fun List<String>.toJsonArray(): org.json.JSONArray {
+        return org.json.JSONArray().also { array ->
+            forEach { array.put(it) }
+        }
+    }
+
+    return org.json.JSONObject().apply {
+        put("equipment", equipment)
+        put("location", location)
+        put("symptom", symptom)
+        put("severity", severity)
+        put("status", status)
+        put("summary", summary)
+        put("causes", causes.toJsonArray())
+        put("parts", parts.toJsonArray())
+        put("steps", steps.toJsonArray())
+        put("personnel", personnel.toJsonArray())
+        put("relatedWorkOrders", relatedWorkOrders.toJsonArray())
+    }
+}
+
 private fun wrapTextForPdf(text: String, paint: Paint, maxWidth: Float): List<String> {
     if (text.isBlank()) return listOf("暂无诊断数据")
 
@@ -1069,8 +1222,20 @@ private fun exportWorkOrderPdf(
 
 private data class HistoryEntry(
     val timestamp: Long, val userText: String, val aiText: String,
-    val isGraphRAG: Boolean = false, val isImage: Boolean = false, val isVideo: Boolean = false,
+    val isGraphRAG: Boolean = false,
+    val isImage: Boolean = false,
+    val isVideo: Boolean = false,
+    val isWorkOrder: Boolean = false,
 )
+
+private enum class HistoryFilter(val label: String) {
+    ALL("全部"),
+    GRAPH("图谱"),
+    IMAGE("图片"),
+    VIDEO("视频"),
+    WORK_ORDER("工单"),
+    LLM("端侧"),
+}
 
 private const val HISTORY_FILE = "diagnosis_history.json"
 private val historyGson = Gson()
@@ -1360,6 +1525,7 @@ fun PocketOpsRoot() {
             demoServerBaseUrl = demoServerBaseUrl,
             session = activeSession,
             onConfigureServer = { showServerConfigDialog = true },
+            onSessionUpdated = { session = it },
         )
     }
 
@@ -1381,6 +1547,7 @@ fun PocketOpsApp(
     demoServerBaseUrl: String,
     session: PocketOpsSession,
     onConfigureServer: () -> Unit,
+    onSessionUpdated: (PocketOpsSession) -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -1403,11 +1570,15 @@ fun PocketOpsApp(
     var selectedGraphJson by remember { mutableStateOf<String?>(null) }
     var showHistorySheet by remember { mutableStateOf(false) }
     val diagnosisHistory = remember { mutableStateListOf<HistoryEntry>() }
+    val queuedWorkOrders = remember { mutableStateListOf<QueuedWorkOrderSubmission>() }
+    var isSubmittingQueuedWorkOrders by remember { mutableStateOf(false) }
+    var showClearQueuedWorkOrdersDialog by remember { mutableStateOf(false) }
     var needsModelDirectoryAccess by remember { mutableStateOf(false) }
     var syncSummary by remember { mutableStateOf("") }
     var remoteBootstrapState by remember { mutableStateOf(RemoteBootstrapState.NOT_CONFIGURED) }
 
     LaunchedEffect(Unit) { diagnosisHistory.addAll(loadHistory(context)) }
+    LaunchedEffect(Unit) { queuedWorkOrders.addAll(loadQueuedWorkOrders(context)) }
 
     // Sync animation state
     data class SyncStep(val label: String, val detail: String)
@@ -1655,13 +1826,91 @@ fun PocketOpsApp(
         refreshGenieServiceStatusWithDemo()
     }
 
+    fun trySubmitQueuedWorkOrders(showToast: Boolean = false) {
+        if (isSubmittingQueuedWorkOrders || queuedWorkOrders.isEmpty()) return
+        isSubmittingQueuedWorkOrders = true
+        scope.launch {
+            val workingQueue = queuedWorkOrders.toMutableList()
+            var sessionForSubmit = session
+            var credentialError: String? = null
+            if (sessionForSubmit.accessToken.isBlank() && demoServerBaseUrl.isNotBlank()) {
+                val savedCredentials = withContext(Dispatchers.IO) { loadSavedLoginCredentials(context) }
+                if (savedCredentials.username.isBlank() || savedCredentials.password.isBlank()) {
+                    credentialError = "当前是离线登录，且未保存密码；请退出后在联网状态重新登录，或勾选记住密码后再提交。"
+                } else {
+                    runCatching {
+                        withContext(Dispatchers.IO) {
+                            authenticatePocketOpsUser(
+                                baseUrl = demoServerBaseUrl,
+                                username = savedCredentials.username,
+                                password = savedCredentials.password,
+                            )
+                        }
+                    }.onSuccess { refreshedSession ->
+                        if (refreshedSession.accessToken.isNotBlank()) {
+                            sessionForSubmit = refreshedSession
+                            onSessionUpdated(refreshedSession)
+                        } else {
+                            credentialError = "电脑服务仍不可用，工单已保留在本机待提交队列。"
+                        }
+                    }.onFailure { error ->
+                        credentialError = error.message ?: "重新获取提交凭证失败"
+                    }
+                }
+            }
+
+            val (submittedCount, error) = if (credentialError == null) {
+                withContext(Dispatchers.IO) {
+                    flushQueuedWorkOrders(
+                        context = context,
+                        queue = workingQueue,
+                        baseUrl = demoServerBaseUrl,
+                        accessToken = sessionForSubmit.accessToken,
+                        onQueueChanged = {},
+                    )
+                }
+            } else {
+                0 to credentialError
+            }
+            queuedWorkOrders.clear()
+            queuedWorkOrders.addAll(workingQueue)
+            isSubmittingQueuedWorkOrders = false
+            if (showToast || submittedCount > 0) {
+                val message = when {
+                    submittedCount > 0 && queuedWorkOrders.isEmpty() -> "已提交 $submittedCount 个待提交工单"
+                    submittedCount > 0 -> "已提交 $submittedCount 个工单，仍有 ${queuedWorkOrders.size} 个待提交"
+                    error != null -> error
+                    else -> "没有可提交的工单"
+                }
+                Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    fun clearQueuedWorkOrderQueue(showToast: Boolean = true) {
+        if (queuedWorkOrders.isEmpty()) return
+        val removedCount = queuedWorkOrders.size
+        clearQueuedWorkOrders(context, queuedWorkOrders)
+        showClearQueuedWorkOrdersDialog = false
+        if (showToast) {
+            Toast.makeText(context, "已清除 $removedCount 个待提交工单", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    LaunchedEffect(demoServerBaseUrl, session.accessToken, queuedWorkOrders.size) {
+        if (queuedWorkOrders.isNotEmpty() && demoServerBaseUrl.isNotBlank()) {
+            trySubmitQueuedWorkOrders()
+        }
+    }
+
     // Auto-scroll on message updates
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
     }
 
     fun appendHistory(userText: String, aiText: String, isGraphRAG: Boolean = false, isImage: Boolean = false, isVideo: Boolean = false) {
-        val entry = HistoryEntry(System.currentTimeMillis(), userText, aiText, isGraphRAG, isImage, isVideo)
+        val isWorkOrder = userText.contains("工单") || aiText.startsWith("工单号：")
+        val entry = HistoryEntry(System.currentTimeMillis(), userText, aiText, isGraphRAG, isImage, isVideo, isWorkOrder)
         diagnosisHistory.add(entry)
         scope.launch(Dispatchers.IO) { saveHistory(context, diagnosisHistory.toList()) }
     }
@@ -2034,6 +2283,60 @@ fun PocketOpsApp(
                         showHistorySheet = true
                     }
                     Spacer(Modifier.width(4.dp))
+                    Box {
+                        var showQueueMenu by remember { mutableStateOf(false) }
+                        Box {
+                            ToolbarAction(icon = Icons.Default.CloudUpload, contentDescription = "提交待办工单") {
+                                if (queuedWorkOrders.isEmpty()) {
+                                    trySubmitQueuedWorkOrders(showToast = true)
+                                } else {
+                                    showQueueMenu = true
+                                }
+                            }
+                            DropdownMenu(
+                                expanded = showQueueMenu,
+                                onDismissRequest = { showQueueMenu = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("立即提交 ${queuedWorkOrders.size} 个工单") },
+                                    leadingIcon = { Icon(Icons.Default.CloudUpload, null) },
+                                    enabled = queuedWorkOrders.isNotEmpty() && !isSubmittingQueuedWorkOrders,
+                                    onClick = {
+                                        showQueueMenu = false
+                                        trySubmitQueuedWorkOrders(showToast = true)
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("清空待提交队列", color = DangerColor) },
+                                    leadingIcon = { Icon(Icons.Default.DeleteSweep, null, tint = DangerColor) },
+                                    enabled = queuedWorkOrders.isNotEmpty(),
+                                    onClick = {
+                                        showQueueMenu = false
+                                        showClearQueuedWorkOrdersDialog = true
+                                    },
+                                )
+                            }
+                        }
+                        if (queuedWorkOrders.isNotEmpty()) {
+                            Box(
+                                Modifier
+                                    .align(Alignment.TopEnd)
+                                    .offset(x = (-3).dp, y = 3.dp)
+                                    .size(17.dp)
+                                    .background(DangerColor, CircleShape),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    queuedWorkOrders.size.coerceAtMost(9).toString(),
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    textAlign = TextAlign.Center,
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.width(4.dp))
                     ToolbarAction(icon = Icons.Default.Bluetooth, contentDescription = "蓝牙") {
                         showBluetoothDialog = true
                     }
@@ -2275,9 +2578,39 @@ fun PocketOpsApp(
             message = workOrderMessage,
             demoServerBaseUrl = demoServerBaseUrl,
             session = session,
+            queuedWorkOrderCount = queuedWorkOrders.size,
+            onQueueWorkOrder = { workOrderId, createdAt, workOrder ->
+                enqueueWorkOrderSubmission(
+                    context = context,
+                    queue = queuedWorkOrders,
+                    workOrderId = workOrderId,
+                    createdAt = createdAt,
+                    workOrder = workOrder,
+                )
+            },
+            onSubmitQueuedWorkOrders = { showToast -> trySubmitQueuedWorkOrders(showToast = showToast) },
+            onRequestClearQueuedWorkOrders = { showClearQueuedWorkOrdersDialog = true },
             onSaveRecord = { userText, aiText -> appendHistory(userText, aiText) },
             onWorkOrderCompleted = { clearDiagnosisContextAfterWorkOrder() },
             onDismiss = { selectedWorkOrderMessage = null },
+        )
+    }
+
+    if (showClearQueuedWorkOrdersDialog) {
+        AlertDialog(
+            onDismissRequest = { showClearQueuedWorkOrdersDialog = false },
+            title = { Text("清空待提交队列") },
+            text = { Text("将删除本机保存的 ${queuedWorkOrders.size} 个待提交工单。删除后不会再自动上传。") },
+            confirmButton = {
+                TextButton(onClick = { clearQueuedWorkOrderQueue() }) {
+                    Text("确认清空", color = DangerColor)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearQueuedWorkOrdersDialog = false }) {
+                    Text("取消")
+                }
+            },
         )
     }
 
@@ -3053,6 +3386,10 @@ private fun WorkOrderDialog(
     message: PocketMessage,
     demoServerBaseUrl: String,
     session: PocketOpsSession,
+    queuedWorkOrderCount: Int,
+    onQueueWorkOrder: (String, String, WorkOrderDocumentData) -> Unit,
+    onSubmitQueuedWorkOrders: (Boolean) -> Unit,
+    onRequestClearQueuedWorkOrders: () -> Unit,
     onSaveRecord: (String, String) -> Unit,
     onWorkOrderCompleted: () -> Unit,
     onDismiss: () -> Unit,
@@ -3162,6 +3499,30 @@ private fun WorkOrderDialog(
                 }
                 StatusChip(editedWorkOrder.status, AccentSoft, Accent)
             }
+            if (queuedWorkOrderCount > 0) {
+                Spacer(Modifier.height(10.dp))
+                Surface(color = WarningSoft, shape = RoundedCornerShape(14.dp), border = BorderStroke(1.dp, WarningColor.copy(alpha = 0.24f))) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(Icons.Default.CloudUpload, null, tint = WarningColor, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "$queuedWorkOrderCount 个工单待提交，联网后会自动补交。",
+                            fontSize = 12.sp,
+                            color = WarningColor,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { onSubmitQueuedWorkOrders(true) }) {
+                            Text("立即提交", fontSize = 12.sp, color = WarningColor)
+                        }
+                        TextButton(onClick = onRequestClearQueuedWorkOrders) {
+                            Text("清空", fontSize = 12.sp, color = DangerColor)
+                        }
+                    }
+                }
+            }
             Spacer(Modifier.height(16.dp))
 
             EditableWorkOrderSummaryCard(
@@ -3240,6 +3601,23 @@ private fun WorkOrderDialog(
                 border = BorderStroke(1.dp, Accent.copy(alpha = 0.35f)),
             ) {
                 Text("保存修改记录", color = Accent)
+            }
+            Spacer(Modifier.height(8.dp))
+
+            Button(
+                onClick = {
+                    saveEditedRecordIfChanged()
+                    onQueueWorkOrder(workOrderId, createdAt, editedWorkOrder)
+                    onSubmitQueuedWorkOrders(true)
+                    Toast.makeText(context, "工单已进入待提交队列", Toast.LENGTH_SHORT).show()
+                },
+                modifier = Modifier.fillMaxWidth().height(44.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = SuccessColor),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Icon(Icons.Default.CloudUpload, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("提交工单")
             }
             Spacer(Modifier.height(8.dp))
 
@@ -4070,6 +4448,23 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
 private fun HistorySheet(history: List<HistoryEntry>, onDismiss: () -> Unit, onClear: () -> Unit, onRestore: (HistoryEntry) -> Unit) {
     val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.85f).dp
     val dateFormat = remember { SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()) }
+    var query by remember { mutableStateOf("") }
+    var filter by remember { mutableStateOf(HistoryFilter.ALL) }
+    val filteredHistory = remember(history, query, filter) {
+        val normalizedQuery = query.trim().lowercase(Locale.getDefault())
+        history.filter { entry ->
+            val matchesType = when (filter) {
+                HistoryFilter.ALL -> true
+                HistoryFilter.GRAPH -> entry.isGraphRAG
+                HistoryFilter.IMAGE -> entry.isImage
+                HistoryFilter.VIDEO -> entry.isVideo
+                HistoryFilter.WORK_ORDER -> entry.isWorkOrder
+                HistoryFilter.LLM -> !entry.isGraphRAG && !entry.isImage && !entry.isVideo && !entry.isWorkOrder
+            }
+            val searchText = "${entry.userText}\n${entry.aiText}".lowercase(Locale.getDefault())
+            matchesType && (normalizedQuery.isBlank() || searchText.contains(normalizedQuery))
+        }
+    }
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = BgColor) {
         Column(Modifier.fillMaxWidth().heightIn(max = maxSheetHeight).padding(horizontal = 20.dp)) {
@@ -4078,13 +4473,61 @@ private fun HistorySheet(history: List<HistoryEntry>, onDismiss: () -> Unit, onC
                     Text("诊断历史", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = TextMain)
                     Text("恢复上下文或回看已生成诊断。", fontSize = 12.sp, color = TextMuted)
                 }
-                StatusChip("${history.size} 条记录", SurfaceMuted, TextMuted)
+                StatusChip("${filteredHistory.size}/${history.size} 条", SurfaceMuted, TextMuted)
             }
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("搜索设备、故障、工单或诊断内容", fontSize = 13.sp) },
+                leadingIcon = { Icon(Icons.Default.Search, null, tint = TextMuted) },
+                trailingIcon = {
+                    if (query.isNotBlank()) {
+                        IconButton(onClick = { query = "" }) {
+                            Icon(Icons.Default.Close, "清空搜索", tint = TextMuted)
+                        }
+                    }
+                },
+                singleLine = true,
+                shape = RoundedCornerShape(14.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = Color.White,
+                    unfocusedContainerColor = Color.White,
+                    focusedIndicatorColor = BorderSoft,
+                    unfocusedIndicatorColor = BorderSoft,
+                ),
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                HistoryFilter.entries.forEach { item ->
+                    val selected = item == filter
+                    Surface(
+                        color = if (selected) AccentSoft else Color.White,
+                        shape = RoundedCornerShape(999.dp),
+                        border = BorderStroke(1.dp, if (selected) Accent.copy(alpha = 0.35f) else BorderSoft),
+                        modifier = Modifier.clickable { filter = item },
+                    ) {
+                        Text(
+                            item.label,
+                            fontSize = 12.sp,
+                            color = if (selected) Accent else TextMuted,
+                            fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
             if (history.isEmpty()) {
                 Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) { Text("暂无诊断记录", fontSize = 14.sp, color = TextMuted) }
+            } else if (filteredHistory.isEmpty()) {
+                Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) { Text("没有匹配的历史记录", fontSize = 14.sp, color = TextMuted) }
             } else {
                 LazyColumn(Modifier.weight(1f)) {
-                    items(history.reversed()) { entry ->
+                    items(filteredHistory.reversed()) { entry ->
                         Card(
                             Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { onRestore(entry); onDismiss() },
                             colors = CardDefaults.cardColors(containerColor = Color.White),
@@ -4095,8 +4538,19 @@ private fun HistorySheet(history: List<HistoryEntry>, onDismiss: () -> Unit, onC
                             Column(Modifier.padding(12.dp)) {
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                     Text(dateFormat.format(Date(entry.timestamp)), fontSize = 11.sp, color = TextSubtle)
-                                    val tag = when { entry.isVideo -> "\u89c6\u9891"; entry.isImage -> "\u56fe\u7247"; entry.isGraphRAG -> "\u56fe\u8c31\u8bca\u65ad"; else -> "\u7aef\u4fa7\u6a21\u578b" }
-                                    val tagColor = when { entry.isGraphRAG -> SuccessColor; entry.isImage || entry.isVideo -> Accent; else -> WarningColor }
+                                    val tag = when {
+                                        entry.isWorkOrder -> "工单"
+                                        entry.isVideo -> "视频"
+                                        entry.isImage -> "图片"
+                                        entry.isGraphRAG -> "图谱诊断"
+                                        else -> "端侧模型"
+                                    }
+                                    val tagColor = when {
+                                        entry.isWorkOrder -> PrimaryMid
+                                        entry.isGraphRAG -> SuccessColor
+                                        entry.isImage || entry.isVideo -> Accent
+                                        else -> WarningColor
+                                    }
                                     StatusChip(tag, tagColor.copy(alpha = 0.12f), tagColor)
                                 }
                                 Spacer(Modifier.height(6.dp))

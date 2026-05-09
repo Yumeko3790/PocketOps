@@ -9,6 +9,7 @@
 - 返回 `POST /api/pocketops/auth/login`
 - 返回 `GET /api/pocketops/bootstrap/manifest`
 - 返回 `POST /api/pocketops/materials/query`
+- 返回 `POST /api/pocketops/work-orders/submit`
 - 通过 `/files/...` 提供静态资源下载
 - 支持 `GET`、`HEAD` 和 `Range`，可用于验证断点续传
 - 优先读取真实仓库里的 `knowledge_graph.json`
@@ -136,6 +137,16 @@ GET  /files/materials/hydraulic_pump_sop.pdf
 Authorization: Bearer <accessToken>
 Range: bytes=0-1023
 ```
+
+### 5. 工单提交
+
+```http
+POST /api/pocketops/work-orders/submit
+Content-Type: application/json
+Authorization: Bearer <accessToken>
+```
+
+Android 端会先把工单保存到本机待提交队列，再尝试提交。电脑服务不可用时不会丢单；服务恢复后会自动补交。
 
 ## 返回的示例文件
 
