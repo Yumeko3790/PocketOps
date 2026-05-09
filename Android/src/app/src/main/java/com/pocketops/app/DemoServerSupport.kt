@@ -27,6 +27,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
@@ -108,8 +109,47 @@ data class DemoMaterial(
     val linkedEntities: DemoLinkedEntities = DemoLinkedEntities(),
 )
 
+data class DemoSubmittedWorkOrderPayload(
+    val tenantId: String = "",
+    val siteId: String = "",
+    val clientSubmissionId: String = "",
+    val workOrderId: String = "",
+    val createdAt: String = "",
+    val queuedAt: Long = 0L,
+    val attemptCount: Int = 0,
+    val source: String = "",
+    val workOrder: DemoSubmittedWorkOrderData = DemoSubmittedWorkOrderData(),
+)
+
+data class DemoSubmittedWorkOrderData(
+    val equipment: String = "",
+    val location: String = "",
+    val symptom: String = "",
+    val severity: String = "",
+    val status: String = "",
+    val summary: String = "",
+    val causes: List<String> = emptyList(),
+    val parts: List<String> = emptyList(),
+    val steps: List<String> = emptyList(),
+    val personnel: List<String> = emptyList(),
+    val relatedWorkOrders: List<String> = emptyList(),
+)
+
+data class DemoSubmittedWorkOrder(
+    val clientSubmissionId: String = "",
+    val workOrderId: String = "",
+    val serverWorkOrderId: String = "",
+    val submittedAt: String = "",
+    val payload: DemoSubmittedWorkOrderPayload = DemoSubmittedWorkOrderPayload(),
+)
+
 private data class DemoMaterialsResponse(
     val materials: List<DemoMaterial> = emptyList(),
+)
+
+private data class DemoSubmittedWorkOrdersResponse(
+    val count: Int = 0,
+    val records: List<DemoSubmittedWorkOrder> = emptyList(),
 )
 
 private data class DemoHttpResponse(
@@ -244,7 +284,7 @@ suspend fun authenticatePocketOpsUser(
         authenticatePocketOpsOnlineUser(normalized, username, password)
     } catch (e: OnlineAuthenticationRejected) {
         throw e
-    } catch (e: Exception) {
+    } catch (e: IOException) {
         Log.e(TAG, "Online authentication unavailable, trying offline credentials", e)
         authenticatePocketOpsOfflineUser(username, password)
     }
@@ -265,11 +305,8 @@ private suspend fun authenticatePocketOpsOnlineUser(
             method = "POST",
             body = payload.toString(),
         )
-        if (response.code == 401 || response.code == 403) {
-            throw OnlineAuthenticationRejected(buildDemoHttpError("登录失败", response.code, response.body))
-        }
         if (response.code !in 200..299) {
-            throw IllegalStateException(buildDemoHttpError("登录失败", response.code, response.body))
+            throw OnlineAuthenticationRejected(buildDemoHttpError("登录失败", response.code, response.body))
         }
 
         val login = Gson().fromJson(response.body, PocketOpsLoginResponse::class.java)
@@ -441,8 +478,10 @@ suspend fun syncDemoResource(context: Context, resource: DemoResource, accessTok
 }
 
 fun getDemoResourceFile(context: Context, localPath: String): File {
-    val safePath = localPath.replace('/', File.separatorChar)
-    return File(File(context.filesDir, DEMO_SYNC_ROOT_DIR), safePath)
+    return resolveDemoResourceFile(
+        rootDir = File(context.filesDir, DEMO_SYNC_ROOT_DIR),
+        relativePath = localPath,
+    )
 }
 
 suspend fun queryDemoMaterials(
@@ -515,6 +554,25 @@ suspend fun submitDemoWorkOrder(
     if (response.code !in 200..299) {
         throw IllegalStateException(buildDemoHttpError("提交工单失败", response.code, response.body))
     }
+}
+
+suspend fun fetchSubmittedDemoWorkOrders(
+    baseUrl: String,
+    accessToken: String,
+): List<DemoSubmittedWorkOrder> {
+    val normalized = normalizeDemoServerBaseUrl(baseUrl)
+    check(normalized.isNotBlank()) { "电脑服务地址不能为空" }
+    check(accessToken.isNotBlank()) { "当前没有可用登录凭证，请先在线登录" }
+
+    val response = sendDemoJsonRequest(
+        url = "$normalized/api/pocketops/work-orders/submitted",
+        method = "GET",
+        bearerToken = accessToken,
+    )
+    if (response.code !in 200..299) {
+        throw IllegalStateException(buildDemoHttpError("获取云端工单失败", response.code, response.body))
+    }
+    return Gson().fromJson(response.body, DemoSubmittedWorkOrdersResponse::class.java).records
 }
 
 suspend fun downloadDemoMaterial(context: Context, material: DemoMaterial, accessToken: String): File {
@@ -616,20 +674,25 @@ fun DemoServerConfigDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("\u914d\u7f6e\u7535\u8111\u670d\u52a1") },
+        title = { Text("配置电脑服务") },
         text = {
             Column {
-                Text("\u7528\u4e8e\u8fde\u63a5\u7535\u8111\u7aef\u6a21\u62df\u670d\u52a1\uff0c\u540c\u6b65\u77e5\u8bc6\u5e93\u8d44\u6599\u5e76\u4e0b\u8f7d\u9644\u4ef6\u3002")
+                Text(
+                    "用于连接电脑端模拟服务，同步知识库资料并下载附件。",
+                )
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = draftUrl,
                     onValueChange = { draftUrl = it },
-                    label = { Text("\u7535\u8111\u670d\u52a1\u5730\u5740") },
+                    label = { Text("电脑服务地址") },
                     placeholder = { Text("http://192.168.1.8:8080") },
                     singleLine = true,
                 )
                 Spacer(Modifier.height(8.dp))
-                Text("\u4e0e\u7535\u8111\u5904\u4e8e\u540c\u4e00\u5c40\u57df\u7f51\u65f6\u586b\u5199\u7535\u8111\u5730\u5740\uff1b\u82e5\u5df2\u505a\u7aef\u53e3\u53cd\u5411\u4ee3\u7406\uff0c\u8bf7\u586b\u5199 http://127.0.0.1:8080")
+                Text(
+                    "与电脑处于同一局域网时填写电脑地址；" +
+                        "若已做端口反向代理，请填写 http://127.0.0.1:8080",
+                )
             }
         },
         confirmButton = {
@@ -709,11 +772,12 @@ private fun sha256(file: File): String {
 }
 
 private fun unzipToDir(zipFile: File, targetDir: File) {
-    targetDir.mkdirs()
+    val rootDir = targetDir.canonicalFile
+    rootDir.mkdirs()
     ZipInputStream(zipFile.inputStream().buffered()).use { zipInput ->
         var entry = zipInput.nextEntry
         while (entry != null) {
-            val outputFile = File(targetDir, entry.name)
+            val outputFile = resolveChildWithinRoot(rootDir, entry.name)
             if (entry.isDirectory) {
                 outputFile.mkdirs()
             } else {
@@ -760,6 +824,28 @@ private fun sendDemoJsonRequest(
     } finally {
         connection.disconnect()
     }
+}
+
+private fun resolveDemoResourceFile(rootDir: File, relativePath: String): File {
+    val root = rootDir.canonicalFile
+    root.mkdirs()
+    return resolveChildWithinRoot(root, relativePath)
+}
+
+private fun resolveChildWithinRoot(rootDir: File, relativePath: String): File {
+    val normalizedPath = relativePath
+        .replace('\\', '/')
+        .trim()
+        .trimStart('/')
+    check(normalizedPath.isNotBlank()) { "资源路径不能为空" }
+    check(!normalizedPath.contains('\u0000')) { "资源路径包含非法字符" }
+    val target = File(rootDir, normalizedPath).canonicalFile
+    val rootPath = rootDir.canonicalPath
+    val targetPath = target.canonicalPath
+    check(targetPath == rootPath || targetPath.startsWith(rootPath + File.separator)) {
+        "资源路径越界: $relativePath"
+    }
+    return target
 }
 
 private fun HttpURLConnection.setBearerToken(token: String?) {

@@ -45,6 +45,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Assignment
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.Build
@@ -154,6 +155,14 @@ private fun runtimeStatusColor(genieReady: Boolean, remoteState: RemoteBootstrap
 }
 
 private const val SYSTEM_PROMPT = """你是工业叉车诊断助手。请严格按JSON格式输出：{"equipment":"设备","symptom":"症状","severity":"高/中/低","causes":[{"name":"原因","probability":80}],"parts":[{"name":"备件","spec":"规格","stock":"充足"}],"steps":[{"title":"步骤","duration":"耗时","tool":"工具"}]}。只输出JSON，不要其他文字。"""
+
+private const val EDGE_DEEP_DIAGNOSIS_PROMPT = """你是运行在端侧NPU上的工业叉车深度诊断模型。用户问题已经命中本地知识图谱，知识图谱事实是最终诊断主体，你只能在这些事实之上补充推理解释。严禁改写、替换或新增equipment、location、symptom、severity、causes、parts、steps、personnel、workOrders中的事实。必须严格输出JSON，且只输出这些字段：diagnosisBasis、followUpQuestions、riskNote、temporaryAction。diagnosisBasis说明图谱证据为什么支持当前排查顺序；followUpQuestions列出现场还要补采的数据；riskNote说明继续运行风险；temporaryAction给出短时安全处置。不要输出Markdown。"""
+
+private const val UNKNOWN_SYMPTOM_PROMPT = """你是运行在端侧NPU上的工业叉车泛化诊断模型。当前用户症状没有被知识库直接命中，你必须明确表达“知识库未直接命中”，只能给出假设和排查路径，不能编造确定故障码或确定结论。必须严格输出JSON，字段包括：equipment、location、symptom、severity、causes、parts、steps、personnel、workOrders、diagnosisBasis、followUpQuestions、riskNote、temporaryAction。causes按假设可信度排序，steps优先采集可验证数据。只输出JSON，不要输出Markdown。"""
+
+private const val WORK_ORDER_FOLLOW_UP_PROMPT = """你是PocketOps工单后续诊断助手。当前对话是在已有诊断/工单之后继续补充信息或追问。你的任务不是简单记录，而是解释“本轮新增信息”对当前工单的诊断意义。不要复述整份诊断报告，不要重新生成诊断JSON，不要提示生成新工单，不要重复发送工单内容。必须围绕本轮输入给出判断、依据、影响和下一步。"""
+
+private const val VISUAL_FOLLOW_UP_PROMPT = """你是PocketOps图片/视频后续追问助手。你只能基于上一轮视觉分析摘要回答用户的新问题。必须使用自然中文短答，不要输出JSON，不要输出诊断报告格式，不要重新生成工单。若用户问维修建议，可以按观察、判断、下一步给出简短条目；若证据不足，明确说明需要补拍或补充设备编号/参数。"""
 
 private const val IMAGE_SYSTEM_PROMPT = """你是PocketOps工业车辆诊断助手，擅长识别工业设备图片。请仔细观察图片内容，只能使用简体中文回答用户的问题。回答要专业、详细、准确，包括你在图片中看到的所有相关信息（文字、数字、标签、设备状态、部件名称等）。除图片中原始英文标签外，不要输出英文句子。"""
 private const val VIDEO_SYSTEM_PROMPT = """你是PocketOps工业车辆诊断助手，当前收到的是从同一段工业设备视频中抽取的多帧拼图。请结合时间顺序综合分析设备状态、异常动作、故障线索、仪表/标签信息和可能的风险点。必须只用简体中文直接回答，不要输出英文分析句子。画面中的原始英文标签、设备编号、故障码和单位可以保留原文，但需要用中文解释其含义。"""
@@ -470,12 +479,19 @@ private fun createManageModelDirectoryAccessIntent(context: Context): Intent {
 private fun clearGenieChatState() {
     try {
         val conn = (java.net.URL("http://127.0.0.1:8910/clear").openConnection() as java.net.HttpURLConnection).apply {
-            requestMethod = "POST"; connectTimeout = 2000; readTimeout = 2000; doOutput = true
+            requestMethod = "POST"
+            connectTimeout = 2000
+            readTimeout = 2000
+            doOutput = true
         }
-        conn.outputStream.use { it.write("{}".toByteArray()) }
-        conn.responseCode
-        conn.disconnect()
-    } catch (_: Exception) {}
+        try {
+            conn.outputStream.use { it.write("{}".toByteArray()) }
+            conn.responseCode
+        } finally {
+            conn.disconnect()
+        }
+    } catch (_: Exception) {
+    }
 }
 
 private data class ExtractedVideoFrames(
@@ -629,6 +645,52 @@ data class LlmReport(
     val steps: List<Triple<String, String, String>>,
     val personnel: List<Triple<String, String, String>>,
     val workOrders: List<Triple<String, String, String>>,
+    val diagnosisBasis: List<String> = emptyList(),
+    val followUpQuestions: List<String> = emptyList(),
+    val riskNote: String = "",
+    val temporaryAction: String = "",
+)
+
+data class FieldChecklistItem(
+    val title: String,
+    val detail: String,
+    val impact: String,
+)
+
+data class FieldChecklist(
+    val title: String,
+    val reason: String,
+    val items: List<FieldChecklistItem>,
+)
+
+private enum class FieldFaultCategory(val label: String) {
+    NO_START("无法启动"),
+    LIFT_SLOW("举升缓慢"),
+    HYDRAULIC_LEAK("液压油泄漏"),
+    STEERING_HEAVY("转向沉重"),
+    OVERHEAT("发动机过热"),
+    BRAKE_FAILURE("制动失灵"),
+    ABNORMAL_NOISE("异响"),
+    EMERGENCY_STOP("偶发急停"),
+}
+
+private data class OfflineTriageContext(
+    val category: FieldFaultCategory,
+    val initialInput: String,
+)
+
+private data class OfflineTriageReply(
+    val text: String,
+    val context: OfflineTriageContext,
+    val checklist: FieldChecklist,
+)
+
+private data class WorkOrderQualityReview(
+    val score: Int,
+    val level: String,
+    val missingItems: List<String>,
+    val suggestions: List<String>,
+    val strengths: List<String>,
 )
 
 fun parseLlmReport(text: String): LlmReport? {
@@ -674,15 +736,341 @@ fun parseLlmReport(text: String): LlmReport? {
                 workOrders.add(Triple(w.optString("id"), w.optString("date"), w.optString("resolution")))
             }
         }
+        val diagnosisBasis = obj.optStringList("diagnosisBasis")
+        val followUpQuestions = obj.optStringList("followUpQuestions")
         return LlmReport(
             equipment = obj.optString("equipment"), location = obj.optString("location"),
             symptom = obj.optString("symptom"), severity = obj.optString("severity"),
             causes = causes, parts = parts, steps = steps, personnel = personnel, workOrders = workOrders,
+            diagnosisBasis = diagnosisBasis,
+            followUpQuestions = followUpQuestions,
+            riskNote = obj.optString("riskNote"),
+            temporaryAction = obj.optString("temporaryAction"),
         )
     } catch (e: Exception) {
         Log.d("PocketOps", "JSON parse failed: ${e.message}")
         return null
     }
+}
+
+private fun org.json.JSONObject.optStringList(name: String): List<String> {
+    val array = optJSONArray(name) ?: return emptyList()
+    val values = mutableListOf<String>()
+    for (index in 0 until array.length()) {
+        val value = array.opt(index)
+        when (value) {
+            is String -> value
+            is org.json.JSONObject -> value.optString("text").ifBlank { value.optString("name") }.ifBlank { value.toString() }
+            else -> value?.toString().orEmpty()
+        }.trim().takeIf { it.isNotBlank() }?.let { values.add(it) }
+    }
+    return values
+}
+
+private fun inferFieldFaultCategory(text: String): FieldFaultCategory? {
+    val normalized = text.trim()
+    if (normalized.isBlank()) return null
+    return when {
+        listOf("无法启动", "启动不了", "打不着", "无反应", "不能启动").any { normalized.contains(it) } -> FieldFaultCategory.NO_START
+        listOf("举升缓慢", "举升慢", "升不动", "液压压力低", "压力偏低").any { normalized.contains(it) } -> FieldFaultCategory.LIFT_SLOW
+        listOf("液压油泄漏", "漏油", "渗油").any { normalized.contains(it) } -> FieldFaultCategory.HYDRAULIC_LEAK
+        listOf("转向沉重", "方向沉", "转向困难").any { normalized.contains(it) } -> FieldFaultCategory.STEERING_HEAVY
+        listOf("发动机过热", "水温高", "温度过高", "过热").any { normalized.contains(it) } -> FieldFaultCategory.OVERHEAT
+        listOf("制动失灵", "刹不住", "刹车失灵", "制动距离").any { normalized.contains(it) } -> FieldFaultCategory.BRAKE_FAILURE
+        listOf("异响", "噪音", "响声").any { normalized.contains(it) } -> FieldFaultCategory.ABNORMAL_NOISE
+        listOf("急停", "偶发停机", "突然停机", "自动停机").any { normalized.contains(it) } -> FieldFaultCategory.EMERGENCY_STOP
+        else -> null
+    }
+}
+
+private fun shouldStartOfflineTriage(userInput: String, workOrderContext: String): Boolean {
+    if (workOrderContext.isNotBlank()) return false
+    val text = userInput.trim()
+    inferFieldFaultCategory(text) ?: return false
+    val asksTriage = listOf("问诊", "排查", "先查", "检查什么", "下一步").any { text.contains(it) }
+    if (asksTriage) return true
+    val directDiagnosisIntent = listOf("维修建议", "诊断", "原因", "怎么修", "处理方案", "生成工单", "工单").any { text.contains(it) }
+    val alreadyHasEvidence = extractVoltage(text) != null || extractPressure(text) != null || extractFaultCodes(text).isNotEmpty()
+    return text.length <= 24 && !directDiagnosisIntent && !alreadyHasEvidence
+}
+
+private fun shouldTreatAsOfflineTriageFollowUp(userInput: String, context: OfflineTriageContext): Boolean {
+    val text = userInput.trim()
+    if (text.isBlank()) return false
+    if (isExplicitNewDiagnosisRequest(text)) return false
+    val newCategory = inferFieldFaultCategory(text)
+    if (newCategory != null && newCategory != context.category && listOf("叉车", "AGV", "搬运车", "设备").any { text.contains(it) }) {
+        return false
+    }
+    val answerSignals =
+        listOf(
+            "电压", "压力", "故障码", "仪表", "亮", "不亮", "有声音", "无声音", "无反应",
+            "偶发", "一直", "重启", "恢复", "油位", "漏油", "温度", "空载", "负载", "制动",
+        )
+    return text.length <= 120 && (
+        answerSignals.any { text.contains(it) } ||
+            extractVoltage(text) != null ||
+            extractPressure(text) != null ||
+            extractFaultCodes(text).isNotEmpty()
+        )
+}
+
+private fun shouldTreatAsVisualFollowUp(userInput: String, visualContextText: String): Boolean {
+    val text = userInput.trim()
+    if (text.isBlank() || visualContextText.isBlank()) return false
+    if (isEquipmentLookupQuestion(text)) return false
+    if (isExplicitNewDiagnosisRequest(text)) return false
+    val visualReferenceSignals =
+        listOf(
+            "图片", "照片", "视频", "画面", "图里", "图中", "这张", "这个", "这里", "这处",
+            "这个部位", "它", "上面", "刚才", "刚刚", "看到", "能看出", "画面里",
+        )
+    return text.length <= 120 && visualReferenceSignals.any { text.contains(it) }
+}
+
+private fun isDiagnosticWorkOrderIntent(text: String): Boolean {
+    return listOf(
+        "诊断", "故障", "维修", "处理", "建议", "原因", "怎么修", "怎么处理",
+        "生成工单", "工单", "排查", "风险", "还能运行",
+    ).any { text.contains(it) }
+}
+
+private fun buildOfflineTriageQuestionnaire(userInput: String): OfflineTriageReply? {
+    val category = inferFieldFaultCategory(userInput) ?: return null
+    val questions = triageQuestions(category)
+    val example = when (category) {
+        FieldFaultCategory.NO_START -> "仪表亮，电压9.2V，启动无反应，暂无故障码"
+        FieldFaultCategory.LIFT_SLOW -> "油位偏低，液压压力0.8bar，负载时更慢"
+        FieldFaultCategory.HYDRAULIC_LEAK -> "门架油缸附近渗油，油位下降，地面有油迹"
+        FieldFaultCategory.STEERING_HEAVY -> "低速转向沉，液压油位正常，无明显异响"
+        FieldFaultCategory.OVERHEAT -> "水温高，风扇转，冷却液液位偏低"
+        FieldFaultCategory.BRAKE_FAILURE -> "踏板偏软，制动距离变长，无明显漏油"
+        FieldFaultCategory.ABNORMAL_NOISE -> "举升时异响，空载较轻，门架附近更明显"
+        FieldFaultCategory.EMERGENCY_STOP -> "偶发急停，重启恢复，暂无明确故障码"
+    }
+    val text = buildString {
+        appendLine("端侧问诊排查：已识别为“${category.label}”。")
+        appendLine("先补齐下面信息，我会根据回答收敛原因，不需要联网。")
+        questions.forEachIndexed { index, question -> appendLine("${index + 1}. $question") }
+        appendLine()
+        appendLine("可直接回复：$example")
+    }.trim()
+    return OfflineTriageReply(
+        text = text,
+        context = OfflineTriageContext(category, userInput),
+        checklist = buildBaseFieldChecklist(category),
+    )
+}
+
+private fun buildOfflineTriageFollowUpReply(userInput: String, context: OfflineTriageContext): OfflineTriageReply {
+    val voltage = extractVoltage(userInput)
+    val pressure = extractPressure(userInput)
+    val faultCodes = extractFaultCodes(userInput)
+    val findings = mutableListOf<String>()
+    voltage?.let { value ->
+        findings.add(
+            if (value < 10.5) {
+                "电压${formatNumber(value)}V明显偏低，会优先指向电池亏电、接线柱松动、主电源回路压降或接触器供电不足。"
+            } else {
+                "电压${formatNumber(value)}V未表现为明显低压，启动问题要继续看故障码、继电器动作和启动回路。"
+            },
+        )
+    }
+    pressure?.let { value ->
+        findings.add(
+            if (value < 1.0) {
+                "压力${formatNumber(value)}bar偏低，与举升缓慢、液压泵吸空、油位不足或滤芯堵塞高度相关。"
+            } else {
+                "压力${formatNumber(value)}bar已记录，需结合额定压力和负载工况判断是否异常。"
+            },
+        )
+    }
+    if (faultCodes.isNotEmpty()) {
+        findings.add("故障码${faultCodes.joinToString("、")}会提高电控和传感器方向的排查优先级，建议拍照留存并查控制器定义。")
+    }
+    if (findings.isEmpty()) {
+        findings.add("本轮信息已记录，但还缺少可量化参数。优先补充电压、压力、温度、故障码或故障出现工况。")
+    }
+
+    val nextSteps = triageNextSteps(context.category, userInput)
+    val text = buildString {
+        appendLine("端侧问诊判断：")
+        findings.forEach { appendLine("- $it") }
+        appendLine()
+        appendLine("下一步优先做：")
+        nextSteps.forEachIndexed { index, step -> appendLine("${index + 1}. $step") }
+        appendLine()
+        appendLine("如果要形成工单，建议把本轮参数、已检查项目和故障码一起保存。")
+    }.trim()
+    return OfflineTriageReply(
+        text = text,
+        context = context,
+        checklist = buildBaseFieldChecklist(context.category),
+    )
+}
+
+private fun triageQuestions(category: FieldFaultCategory): List<String> {
+    return when (category) {
+        FieldFaultCategory.NO_START ->
+            listOf("仪表是否亮起，急停开关是否复位？", "启动时电机、接触器或继电器是否有动作声音？", "电池或主电源电压是多少，启动瞬间是否明显下跌？", "控制器或仪表是否有故障码？")
+        FieldFaultCategory.LIFT_SLOW ->
+            listOf("空载和负载时是否都举升慢？", "液压油位、油液颜色和泄漏情况如何？", "液压压力实测值是多少？", "滤芯、油管和液压泵最近是否维护过？")
+        FieldFaultCategory.HYDRAULIC_LEAK ->
+            listOf("漏油位置在油缸、油管、接头还是阀块？", "停车静置和动作时哪种状态漏得更明显？", "液压油位下降速度如何？", "是否伴随举升无力或压力偏低？")
+        FieldFaultCategory.STEERING_HEAVY ->
+            listOf("原地、低速和负载转向时哪种更明显？", "液压油位和转向泵声音是否正常？", "方向盘是否有卡滞或回正异常？", "轮胎气压和转向机构是否有机械阻力？")
+        FieldFaultCategory.OVERHEAT ->
+            listOf("过热发生在怠速、负载还是长时间运行后？", "冷却液液位、风扇和散热器是否正常？", "仪表温度值或报警码是多少？", "近期是否清洗过散热器或更换冷却液？")
+        FieldFaultCategory.BRAKE_FAILURE ->
+            listOf("踏板行程是否变长或变软？", "制动液/液压油是否下降或泄漏？", "单侧还是双侧制动异常？", "是否有异响、拖滞或制动距离明显变长？")
+        FieldFaultCategory.ABNORMAL_NOISE ->
+            listOf("异响来自门架、液压泵、发动机还是轮端？", "空载、负载、转向或举升哪个动作会触发？", "声音是尖啸、敲击、摩擦还是震动？", "是否伴随温度、压力或速度异常？")
+        FieldFaultCategory.EMERGENCY_STOP ->
+            listOf("急停发生时仪表是否掉电或重启？", "是否有故障码、报警灯或蜂鸣？", "重启后能维持多久，是否与颠簸、转向或负载有关？", "电池电压、急停回路和控制器接插件是否检查过？")
+    }
+}
+
+private fun triageNextSteps(category: FieldFaultCategory, userInput: String): List<String> {
+    val voltage = extractVoltage(userInput)
+    return when (category) {
+        FieldFaultCategory.NO_START -> {
+            if (voltage != null && voltage < 10.5) {
+                listOf("先给电池补电或更换已知正常电池复测。", "清洁并紧固电池接线柱、主保险和接触器端子。", "复测启动瞬间电压，仍下跌则检查电池内阻或主电缆压降。")
+            } else {
+                listOf("读取控制器故障码并拍照留存。", "用万用表确认钥匙开关、急停回路和主接触器线圈供电。", "区分是启动电机不转、接触器不吸合还是控制器禁止启动。")
+            }
+        }
+        FieldFaultCategory.LIFT_SLOW -> listOf("先复测液压油位和液压压力。", "检查滤芯、吸油管路和油液污染情况。", "负载状态复测举升速度，确认是否液压泵效率下降。")
+        FieldFaultCategory.HYDRAULIC_LEAK -> listOf("清洁油迹后短动作复现，定位新油迹来源。", "检查接头、密封圈和油缸杆表面划伤。", "漏点未确认前不要直接补油交付。")
+        FieldFaultCategory.STEERING_HEAVY -> listOf("先排除轮胎气压和机械卡滞。", "复测转向液压压力和泵噪声。", "检查转向阀、油管和转向桥连接。")
+        FieldFaultCategory.OVERHEAT -> listOf("清理散热器表面并确认风扇工作。", "检查冷却液液位、皮带和节温器状态。", "记录过热出现时间和负载工况。")
+        FieldFaultCategory.BRAKE_FAILURE -> listOf("先暂停使用并设置警示。", "检查制动液/液压油泄漏和踏板行程。", "按单侧/双侧异常区分管路、制动器和主缸问题。")
+        FieldFaultCategory.ABNORMAL_NOISE -> listOf("录制异响视频并标记动作工况。", "按门架、液压泵、轮端、发动机分区听诊。", "同步记录压力、温度和负载状态。")
+        FieldFaultCategory.EMERGENCY_STOP -> listOf("检查电池电压、急停开关和主接触器接插件。", "读取控制器事件日志或故障码。", "复现时观察是否与颠簸、负载或转向动作相关。")
+    }
+}
+
+private fun buildBaseFieldChecklist(category: FieldFaultCategory): FieldChecklist {
+    val items = when (category) {
+        FieldFaultCategory.NO_START -> listOf(
+            FieldChecklistItem("确认仪表和急停状态", "记录仪表是否亮起、急停是否复位、钥匙开关是否有效。", "区分整车掉电、急停回路和启动许可问题。"),
+            FieldChecklistItem("测量电池/主电源电压", "记录静态电压和启动瞬间压降。", "低压会直接导致无法启动或控制器复位。"),
+            FieldChecklistItem("听接触器或继电器动作", "启动时确认是否吸合、抖动或完全无声。", "判断故障在控制回路还是主动力回路。"),
+            FieldChecklistItem("读取并拍照保存故障码", "记录仪表、控制器或蓝牙采集到的故障码。", "为工单复盘和备件判断提供证据。"),
+        )
+        FieldFaultCategory.LIFT_SLOW -> listOf(
+            FieldChecklistItem("检查液压油位和泄漏", "看油位、油液颜色、油管接头和油缸周边油迹。", "油位不足和吸空是举升慢的高频原因。"),
+            FieldChecklistItem("实测液压压力", "在空载和负载下分别记录压力值。", "压力偏低可定位泵、滤芯、阀组或泄漏方向。"),
+            FieldChecklistItem("检查滤芯和吸油管路", "确认滤芯堵塞、吸油管变形或进气。", "供油受阻会导致动作慢和泵噪声。"),
+            FieldChecklistItem("复测举升速度", "记录空载/负载举升时间。", "便于判断是否达到维修完成标准。"),
+        )
+        FieldFaultCategory.HYDRAULIC_LEAK -> listOf(
+            FieldChecklistItem("清洁后定位新油迹", "擦净旧油迹，短动作观察新漏点。", "避免把旧污染误判为当前漏点。"),
+            FieldChecklistItem("检查接头和密封圈", "重点看油管接头、阀块、油缸密封。", "确认是否需要更换密封件或紧固接头。"),
+            FieldChecklistItem("记录油位下降速度", "记录补油前后和运行后的油位。", "判断泄漏等级和是否允许短时移动。"),
+            FieldChecklistItem("拍摄漏点照片", "包含设备编号、漏点位置和地面油迹。", "提高工单可追溯性。"),
+        )
+        FieldFaultCategory.STEERING_HEAVY -> listOf(
+            FieldChecklistItem("排除轮胎和机械卡滞", "检查轮胎气压、转向桥、拉杆和异物。", "先排除非液压原因。"),
+            FieldChecklistItem("检查转向液压压力", "记录原地和低速转向压力。", "判断转向泵、阀和油路效率。"),
+            FieldChecklistItem("听转向泵声音", "注意尖啸、吸空或抖动。", "辅助判断油液不足或泵磨损。"),
+            FieldChecklistItem("记录触发工况", "区分空载、负载、低速和原地转向。", "帮助收敛故障分支。"),
+        )
+        FieldFaultCategory.OVERHEAT -> listOf(
+            FieldChecklistItem("记录温度和报警", "记录仪表温度、报警灯和出现时间。", "判断过热等级和复现条件。"),
+            FieldChecklistItem("检查冷却液和风扇", "确认液位、风扇转动和皮带状态。", "定位冷却循环基础问题。"),
+            FieldChecklistItem("清理散热器", "检查灰尘、油泥和堵塞。", "散热不良是现场高频原因。"),
+            FieldChecklistItem("记录负载工况", "区分怠速、长时间运行和重载。", "用于判断是否超工况或散热能力不足。"),
+        )
+        FieldFaultCategory.BRAKE_FAILURE -> listOf(
+            FieldChecklistItem("立即停用并警示", "制动异常先禁止继续作业。", "降低现场安全风险。"),
+            FieldChecklistItem("检查踏板行程", "记录踏板是否变软、变长或回位异常。", "判断主缸、管路或制动器方向。"),
+            FieldChecklistItem("检查油液和泄漏", "看制动液/液压油液位和管路漏点。", "泄漏会直接导致制动力不足。"),
+            FieldChecklistItem("区分单侧或双侧", "观察车辆跑偏、单轮拖滞或整体失效。", "帮助定位轮端或主回路。"),
+        )
+        FieldFaultCategory.ABNORMAL_NOISE -> listOf(
+            FieldChecklistItem("录制异响视频", "保留声音、动作和设备位置。", "便于后续复盘和远程协作。"),
+            FieldChecklistItem("定位声音区域", "区分门架、液压泵、发动机、轮端。", "减少盲目拆检。"),
+            FieldChecklistItem("记录触发动作", "举升、转向、行走、制动分别测试。", "锁定相关系统。"),
+            FieldChecklistItem("同步记录参数", "压力、温度、速度或负载变化。", "判断是否由负载或温升诱发。"),
+        )
+        FieldFaultCategory.EMERGENCY_STOP -> listOf(
+            FieldChecklistItem("记录急停发生时状态", "看仪表是否掉电、报警或重启。", "区分供电中断和控制器保护。"),
+            FieldChecklistItem("检查电源和急停回路", "检查电池电压、急停开关、接插件和主接触器。", "偶发急停常与接触不良有关。"),
+            FieldChecklistItem("读取控制器故障码", "记录事件日志或报警码。", "确认是否传感器、通信或保护触发。"),
+            FieldChecklistItem("复现触发工况", "标记颠簸、转向、负载或温度条件。", "帮助定位间歇性问题。"),
+        )
+    }
+    return FieldChecklist(
+        title = "离线排查清单：${category.label}",
+        reason = "根据当前症状在本机生成，现场可逐项勾选并把结果写入工单。",
+        items = items,
+    )
+}
+
+private fun buildFieldChecklistForDiagnosis(
+    userInput: String,
+    graphReport: DiagnosticReport? = null,
+    llmContent: String = "",
+): FieldChecklist? {
+    val parsed = llmContent.takeIf { it.isNotBlank() }?.let { parseLlmReport(it) }
+    val contextText = listOf(
+        userInput,
+        graphReport?.symptom?.label.orEmpty(),
+        parsed?.symptom.orEmpty(),
+        llmContent.take(600),
+    ).joinToString(" ")
+    val category = inferFieldFaultCategory(contextText)
+    val baseItems = category?.let { buildBaseFieldChecklist(it).items.take(2) }.orEmpty()
+    val graphItems = graphReport?.steps.orEmpty().map { step ->
+        val meta = listOf(step.properties["duration"].orEmpty(), step.properties["tool"].orEmpty()).filter { it.isNotBlank() }.joinToString(" / ")
+        FieldChecklistItem(step.label, meta.ifBlank { "按图谱维修步骤执行并记录结果。" }, "完成后可调整工单结论和维修优先级。")
+    }
+    val llmStepItems = parsed?.steps.orEmpty().map { (title, duration, tool) ->
+        FieldChecklistItem(title, listOf(duration, tool).filter { it.isNotBlank() }.joinToString(" / ").ifBlank { "按端侧诊断建议执行。" }, "作为现场验证证据写入工单。")
+    }
+    val followUpItems = parsed?.followUpQuestions.orEmpty().take(2).map { question ->
+        FieldChecklistItem("补充：$question", "现场记录、拍照或读取参数后再继续追问。", "补齐后端侧模型可继续收敛原因。")
+    }
+    val items = (baseItems + graphItems + llmStepItems + followUpItems)
+        .filter { it.title.isNotBlank() }
+        .distinctBy { it.title }
+        .take(6)
+    if (items.isEmpty()) return category?.let { buildBaseFieldChecklist(it) }
+    return FieldChecklist(
+        title = "离线排查清单：${category?.label ?: "现场诊断"}",
+        reason = "从本轮诊断步骤和待补充信息生成，不依赖云端。",
+        items = items,
+    )
+}
+
+private fun extractVoltage(text: String): Double? {
+    return Regex("""(\d+(?:\.\d+)?)\s*(?:v|V|伏)""")
+        .find(text)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toDoubleOrNull()
+}
+
+private fun extractPressure(text: String): Double? {
+    return Regex("""(\d+(?:\.\d+)?)\s*(?:bar|BAR|Bar|兆帕|MPa|mpa)""")
+        .find(text)
+        ?.groupValues
+        ?.getOrNull(1)
+        ?.toDoubleOrNull()
+}
+
+private fun extractFaultCodes(text: String): List<String> {
+    return Regex("""[A-Z]{1,2}\d{2,4}""")
+        .findAll(text.uppercase(Locale.getDefault()))
+        .map { it.value }
+        .distinct()
+        .take(5)
+        .toList()
+}
+
+private fun formatNumber(value: Double): String {
+    return if (value % 1.0 == 0.0) value.toInt().toString() else "%.1f".format(Locale.getDefault(), value)
 }
 
 private fun buildDiagnosticReportText(report: DiagnosticReport): String {
@@ -861,6 +1249,8 @@ private fun LlmReport.toWorkOrderDocumentData(graphWorkOrders: List<GraphNode> =
         append("设备出现${if (symptomText.isNotBlank()) symptomText else "待确认故障"}")
         if (locationText.isNotBlank()) append("，位置：$locationText")
         if (severityText.isNotBlank()) append("，严重程度：$severityText")
+        if (riskNote.isNotBlank()) append("，风险提示：$riskNote")
+        if (temporaryAction.isNotBlank()) append("，临时处置：$temporaryAction")
         append("。")
     }
 
@@ -873,7 +1263,7 @@ private fun LlmReport.toWorkOrderDocumentData(graphWorkOrders: List<GraphNode> =
         summary = summary,
         causes = causes.map { (name, probability) ->
             if (probability > 0) "$name ($probability%)" else name
-        },
+        } + diagnosisBasis.map { "推理依据：$it" },
         parts = parts.map { (name, spec, stock) ->
             val extras = listOf(spec, stock).filter { it.isNotBlank() }.joinToString(" / ")
             if (extras.isNotBlank()) "$name - $extras" else name
@@ -881,7 +1271,7 @@ private fun LlmReport.toWorkOrderDocumentData(graphWorkOrders: List<GraphNode> =
         steps = steps.mapIndexed { index, (title, duration, tool) ->
             val extras = listOf(duration, tool).filter { it.isNotBlank() }.joinToString(" / ")
             "${index + 1}. $title${if (extras.isNotBlank()) " ($extras)" else ""}"
-        },
+        } + followUpQuestions.mapIndexed { index, question -> "补采${index + 1}. $question" },
         personnel = personnel.map { (name, skill, experience) ->
             val extras = listOf(skill, experience).filter { it.isNotBlank() }.joinToString(" / ")
             if (extras.isNotBlank()) "$name - $extras" else name
@@ -899,9 +1289,9 @@ private fun buildWorkOrderDocumentData(message: PocketMessage): WorkOrderDocumen
     }
 
     return WorkOrderDocumentData(
-        equipment = "工业叉车",
+        equipment = extractExplicitEquipmentMention(rawText) ?: "工业车辆/现场图片",
         location = "",
-        symptom = "待确认",
+        symptom = inferFieldFaultCategory(rawText)?.label ?: "待确认",
         severity = "",
         status = "待处理",
         summary = rawText,
@@ -911,6 +1301,232 @@ private fun buildWorkOrderDocumentData(message: PocketMessage): WorkOrderDocumen
         personnel = emptyList(),
         relatedWorkOrders = formatGraphWorkOrders(message.relatedWorkOrders),
     )
+}
+
+private fun buildDynamicWorkOrderMessage(
+    clickedMessage: PocketMessage,
+    messages: List<PocketMessage>,
+    conversationHistory: List<Pair<String, String>>,
+    latestVisualContextText: String,
+    activeEquipmentContext: GraphNode?,
+    graph: MaintenanceKnowledgeGraph,
+): PocketMessage {
+    val contextText =
+        buildDynamicWorkOrderContextText(
+            clickedMessage = clickedMessage,
+            messages = messages,
+            conversationHistory = conversationHistory,
+            latestVisualContextText = latestVisualContextText,
+        )
+    val graphResult =
+        buildGraphRAGReport(contextText, graph, activeEquipmentContext)
+            ?: buildGraphRAGReport(contextText, graph)
+    val relatedWorkOrders =
+        graphResult?.first?.workOrders?.takeIf { it.isNotEmpty() }
+            ?: findRelatedWorkOrders(contextText, graph)
+    val dynamicText =
+        graphResult?.let { (report, _) ->
+            buildDynamicGraphWorkOrderJson(report, contextText)
+        } ?: buildDynamicFallbackWorkOrderJson(
+            contextText = contextText,
+            clickedText = clickedMessage.text,
+            activeEquipmentContext = activeEquipmentContext,
+            relatedWorkOrders = relatedWorkOrders,
+        )
+
+    return PocketMessage(
+        text = dynamicText,
+        isUser = false,
+        relatedWorkOrders = relatedWorkOrders,
+        graphJson = graphResult?.second.orEmpty(),
+        sourceLabel = if (graphResult != null) "动态工单 · 图谱补全" else "动态工单 · 端侧整理",
+        canGenerateWorkOrder = false,
+    )
+}
+
+private fun buildDynamicWorkOrderContextText(
+    clickedMessage: PocketMessage,
+    messages: List<PocketMessage>,
+    conversationHistory: List<Pair<String, String>>,
+    latestVisualContextText: String,
+): String {
+    val lines = mutableListOf<String>()
+    latestVisualContextText.takeIf { it.isNotBlank() }?.let {
+        lines.add("最近现场图片/视频分析：")
+        lines.add(it.take(1600))
+    }
+    conversationHistory.takeLast(14).forEach { (role, content) ->
+        val label = if (role == "user") "用户" else "助手"
+        content.trim()
+            .takeIf { it.isNotBlank() && !it.startsWith("正在") }
+            ?.let { lines.add("$label：${it.take(900)}") }
+    }
+    messages.takeLast(12).forEach { message ->
+        val label = if (message.isUser) "用户" else "助手"
+        message.text.trim()
+            .takeIf { it.isNotBlank() && !it.startsWith("正在") }
+            ?.let { lines.add("$label：${it.take(900)}") }
+    }
+    clickedMessage.text.trim().takeIf { it.isNotBlank() }?.let { lines.add("本次生成工单触发内容：${it.take(900)}") }
+    return lines.distinct().joinToString("\n").take(6500)
+}
+
+private fun buildDynamicGraphWorkOrderJson(report: DiagnosticReport, contextText: String): String {
+    val evidence = extractDynamicEvidence(contextText)
+    return buildGraphGroundedDiagnosisJson(
+        graphReport = report,
+        diagnosisBasis = listOf("工单由当前会话动态汇总生成，已合并图片/视频分析、后续追问和现场补充。") + evidence,
+        followUpQuestions = buildDynamicFollowUpQuestions(contextText, report.symptom.label),
+        riskNote = inferDynamicRiskNote(contextText, report.symptom.label),
+        temporaryAction = inferDynamicTemporaryAction(contextText, report.symptom.label),
+        sourceLabel = "动态工单 · 图谱补全",
+    )
+}
+
+private fun buildDynamicFallbackWorkOrderJson(
+    contextText: String,
+    clickedText: String,
+    activeEquipmentContext: GraphNode?,
+    relatedWorkOrders: List<GraphNode>,
+): String {
+    val category = inferFieldFaultCategory(contextText)
+    val equipment =
+        activeEquipmentContext?.label
+            ?: extractExplicitEquipmentMention(contextText)
+            ?: "待确认设备"
+    val symptom = category?.label ?: summarizeDynamicSymptom(contextText, clickedText)
+    val severity =
+        when {
+            containsAny(contextText, listOf("制动失灵", "无法启动", "急停", "高温", "过热")) -> "高"
+            category != null -> "中"
+            else -> "待确认"
+        }
+    val causes = fallbackCausesForCategory(category, contextText)
+    val checklistItems = category?.let { buildBaseFieldChecklist(it).items }.orEmpty()
+    return org.json.JSONObject().apply {
+        put("equipment", equipment)
+        put("location", activeEquipmentContext?.properties?.get("location").orEmpty())
+        put("symptom", symptom)
+        put("severity", severity)
+        put(
+            "causes",
+            org.json.JSONArray().apply {
+                causes.forEach { (name, probability) ->
+                    put(org.json.JSONObject().put("name", name).put("probability", probability))
+                }
+            },
+        )
+        put("parts", org.json.JSONArray())
+        put(
+            "steps",
+            org.json.JSONArray().apply {
+                checklistItems.take(5).forEach { item ->
+                    put(
+                        org.json.JSONObject()
+                            .put("title", item.title)
+                            .put("duration", "现场确认")
+                            .put("tool", item.detail),
+                    )
+                }
+                if (checklistItems.isEmpty()) {
+                    put(org.json.JSONObject().put("title", "补充设备编号、故障部位照片和关键参数").put("duration", "5分钟").put("tool", "手机/万用表/诊断仪"))
+                    put(org.json.JSONObject().put("title", "根据现场参数复核是否需要停机维修").put("duration", "10分钟").put("tool", "点检表"))
+                }
+            },
+        )
+        put("personnel", org.json.JSONArray())
+        put(
+            "workOrders",
+            org.json.JSONArray().apply {
+                relatedWorkOrders.take(4).forEach { workOrder ->
+                    put(
+                        org.json.JSONObject()
+                            .put("id", workOrder.label)
+                            .put("date", workOrder.properties["date"].orEmpty())
+                            .put("resolution", workOrder.properties["resolution"].orEmpty()),
+                    )
+                }
+            },
+        )
+        put(
+            "diagnosisBasis",
+            org.json.JSONArray().apply {
+                put("知识库未直接命中完整场景，当前工单由端侧根据连续问答和现场资料动态整理。")
+                extractDynamicEvidence(contextText).take(5).forEach { put(it) }
+            },
+        )
+        put("followUpQuestions", org.json.JSONArray().apply { buildDynamicFollowUpQuestions(contextText, symptom).forEach { put(it) } })
+        put("riskNote", inferDynamicRiskNote(contextText, symptom))
+        put("temporaryAction", inferDynamicTemporaryAction(contextText, symptom))
+    }.toString()
+}
+
+private fun extractDynamicEvidence(contextText: String): List<String> {
+    val evidence = mutableListOf<String>()
+    extractVoltage(contextText)?.let { evidence.add("已记录电压${formatNumber(it)}V，可用于判断电源或控制器复位风险。") }
+    extractPressure(contextText)?.let { evidence.add("已记录压力${formatNumber(it)}bar，可用于判断液压系统异常程度。") }
+    extractFaultCodes(contextText).takeIf { it.isNotEmpty() }?.let { evidence.add("已记录故障码：${it.joinToString("、")}。") }
+    if (containsAny(contextText, listOf("图片", "照片", "画面", "视频"))) evidence.add("已合并现场图片/视频分析内容。")
+    if (containsAny(contextText, listOf("漏油", "渗油", "油迹"))) evidence.add("现场提到漏油/油迹，需在工单中保留照片和位置描述。")
+    if (containsAny(contextText, listOf("重启", "偶发", "恢复"))) evidence.add("故障呈偶发或重启恢复特征，需记录触发工况和复现条件。")
+    return evidence.distinct().ifEmpty { listOf("已根据当前连续问答整理现场现象，仍需补充可量化参数。") }
+}
+
+private fun buildDynamicFollowUpQuestions(contextText: String, symptom: String): List<String> {
+    val questions = mutableListOf<String>()
+    if (extractExplicitEquipmentMention(contextText) == null) questions.add("请补充设备编号或铭牌照片。")
+    if (extractVoltage(contextText) == null && containsAny(symptom + contextText, listOf("无法启动", "急停", "掉电"))) questions.add("请补充静态电压和启动/故障瞬间电压。")
+    if (extractPressure(contextText) == null && containsAny(symptom + contextText, listOf("举升", "液压", "漏油", "转向"))) questions.add("请补充液压压力、油位和泄漏位置。")
+    if (extractFaultCodes(contextText).isEmpty()) questions.add("请补充仪表或控制器故障码，若没有也请写明“暂无故障码”。")
+    if (!containsAny(contextText, listOf("已检查", "检查过", "复测", "更换", "补油"))) questions.add("请记录已执行的检查动作和结果。")
+    return questions.distinct().take(4)
+}
+
+private fun inferDynamicRiskNote(contextText: String, symptom: String): String {
+    return when {
+        containsAny(symptom + contextText, listOf("制动失灵", "刹不住")) -> "制动异常存在安全风险，应立即停用并设置现场警示。"
+        containsAny(symptom + contextText, listOf("无法启动", "急停", "掉电")) -> "继续反复启动可能扩大电源或控制器故障，应先确认电压和主回路。"
+        containsAny(symptom + contextText, listOf("漏油", "液压油泄漏")) -> "液压泄漏可能导致压力下降和污染现场，未定位漏点前不建议继续作业。"
+        containsAny(symptom + contextText, listOf("过热", "高温")) -> "高温继续运行可能损伤发动机或液压系统，应降载或停机冷却。"
+        else -> "当前信息仍需现场复核，提交前建议补齐关键参数和已检查结果。"
+    }
+}
+
+private fun inferDynamicTemporaryAction(contextText: String, symptom: String): String {
+    return when {
+        containsAny(symptom + contextText, listOf("制动失灵", "刹不住")) -> "暂停使用车辆，拉警戒并安排维修人员现场确认。"
+        containsAny(symptom + contextText, listOf("无法启动", "急停", "掉电")) -> "停止反复启动，先测电压、检查急停回路和主接触器接插件。"
+        containsAny(symptom + contextText, listOf("漏油", "液压油泄漏")) -> "清洁油迹后短动作复现漏点，必要时停机等待维修。"
+        containsAny(symptom + contextText, listOf("举升", "液压")) -> "降低负载或暂停举升作业，先复测油位和液压压力。"
+        else -> "保留现场照片和参数，按端侧检查清单逐项确认后再提交。"
+    }
+}
+
+private fun fallbackCausesForCategory(category: FieldFaultCategory?, contextText: String): List<Pair<String, Int>> {
+    return when (category) {
+        FieldFaultCategory.NO_START -> listOf("电池亏电或主电源压降" to 55, "急停/钥匙/接触器回路异常" to 35, "控制器保护或传感器故障" to 25)
+        FieldFaultCategory.LIFT_SLOW -> listOf("液压油位不足或吸油不畅" to 55, "滤芯堵塞或油液污染" to 40, "液压泵效率下降或内泄" to 35)
+        FieldFaultCategory.HYDRAULIC_LEAK -> listOf("油管接头或密封圈泄漏" to 60, "油缸密封磨损" to 40, "阀块或管路损伤" to 25)
+        FieldFaultCategory.STEERING_HEAVY -> listOf("转向液压压力不足" to 45, "机械卡滞或轮胎阻力异常" to 35, "转向泵/阀异常" to 30)
+        FieldFaultCategory.OVERHEAT -> listOf("散热器堵塞或风扇异常" to 50, "冷却液不足" to 40, "长时间重载运行" to 25)
+        FieldFaultCategory.BRAKE_FAILURE -> listOf("制动液/液压回路泄漏" to 55, "制动器磨损或调整不当" to 40, "主缸或管路进气" to 30)
+        FieldFaultCategory.ABNORMAL_NOISE -> listOf("机械松动或磨损" to 45, "液压泵吸空或轴承异常" to 35, "门架/轮端部件间隙异常" to 30)
+        FieldFaultCategory.EMERGENCY_STOP -> listOf("电源或急停回路接触不良" to 50, "控制器保护触发" to 35, "传感器/通信间歇异常" to 30)
+        null -> {
+            val hasVisual = containsAny(contextText, listOf("图片", "照片", "视频", "画面"))
+            if (hasVisual) listOf("现场图片/视频显示异常但证据不足" to 40, "需补充设备编号和关键参数" to 35)
+            else listOf("现场数据不足，需先采集关键参数" to 45, "部件老化、接插件松动或传感器异常" to 30)
+        }
+    }
+}
+
+private fun summarizeDynamicSymptom(contextText: String, fallbackText: String): String {
+    inferFieldFaultCategory(contextText)?.let { return it.label }
+    val candidate = (fallbackText.ifBlank { contextText })
+        .lineSequence()
+        .map { it.trim().removePrefix("用户：").removePrefix("助手：") }
+        .firstOrNull { it.length in 4..80 && !it.startsWith("{") }
+    return candidate?.take(40) ?: "待确认现场异常"
 }
 
 private fun buildWorkOrderRecordText(
@@ -941,6 +1557,255 @@ private fun buildWorkOrderRecordText(
     appendSection("推荐人员", workOrder.personnel)
     appendSection("相似工单参考", workOrder.relatedWorkOrders)
     return details.toString().trim()
+}
+
+private fun buildWorkOrderQualityReview(workOrder: WorkOrderDocumentData): WorkOrderQualityReview {
+    val allText = listOf(
+        workOrder.equipment,
+        workOrder.location,
+        workOrder.symptom,
+        workOrder.severity,
+        workOrder.summary,
+        workOrder.causes.joinToString(" "),
+        workOrder.steps.joinToString(" "),
+        workOrder.parts.joinToString(" "),
+    ).joinToString(" ")
+    val category = inferFieldFaultCategory(allText)
+    val missing = mutableListOf<String>()
+    val suggestions = mutableListOf<String>()
+    val strengths = mutableListOf<String>()
+
+    if (workOrder.equipment.isBlank() || workOrder.equipment.contains("待确认")) missing.add("设备编号或设备名称")
+    else strengths.add("已填写设备")
+    if (workOrder.symptom.isBlank() || workOrder.symptom.contains("待确认")) missing.add("故障现象")
+    else strengths.add("已填写故障现象")
+    if (workOrder.summary.length < 12) missing.add("故障摘要需要更具体")
+    if (workOrder.causes.isEmpty()) missing.add("可能原因")
+    if (workOrder.steps.isEmpty()) missing.add("排查/维修步骤")
+    else strengths.add("已有${workOrder.steps.size}条步骤")
+    if (workOrder.parts.isEmpty()) suggestions.add("如现场不需要备件，也建议写明“暂无需更换备件”")
+    if (workOrder.relatedWorkOrders.isEmpty()) suggestions.add("可补充相似工单或历史维修记录，便于复盘")
+
+    when (category) {
+        FieldFaultCategory.NO_START -> {
+            if (!containsAny(allText, listOf("电压", "V", "伏", "压降"))) missing.add("电池电压或启动瞬间压降")
+            if (!containsAny(allText, listOf("仪表", "接触器", "继电器", "无反应", "启动声音"))) missing.add("启动时仪表/接触器状态")
+            if (!containsAny(allText, listOf("故障码", "报警", "DTC")) && extractFaultCodes(allText).isEmpty()) suggestions.add("建议补充故障码或说明“暂无故障码”")
+        }
+        FieldFaultCategory.LIFT_SLOW -> {
+            if (!containsAny(allText, listOf("液压压力", "压力", "bar", "MPa", "兆帕"))) missing.add("液压压力实测值")
+            if (!containsAny(allText, listOf("油位", "漏油", "泄漏", "滤芯"))) suggestions.add("建议补充油位、泄漏和滤芯状态")
+        }
+        FieldFaultCategory.HYDRAULIC_LEAK -> {
+            if (!containsAny(allText, listOf("漏点", "油缸", "油管", "接头", "阀块"))) missing.add("漏油位置")
+            if (!containsAny(allText, listOf("照片", "油迹", "油位"))) suggestions.add("建议补充漏点照片和油位变化")
+        }
+        FieldFaultCategory.STEERING_HEAVY -> {
+            if (!containsAny(allText, listOf("轮胎", "转向泵", "转向压力", "原地", "低速"))) suggestions.add("建议补充触发工况和转向压力")
+        }
+        FieldFaultCategory.OVERHEAT -> {
+            if (!containsAny(allText, listOf("温度", "水温", "冷却液", "风扇", "散热器"))) missing.add("温度/冷却系统检查结果")
+        }
+        FieldFaultCategory.BRAKE_FAILURE -> {
+            if (!containsAny(allText, listOf("踏板", "制动液", "刹车", "制动距离", "泄漏"))) missing.add("制动踏板、油液或制动距离记录")
+        }
+        FieldFaultCategory.ABNORMAL_NOISE -> {
+            if (!containsAny(allText, listOf("部位", "门架", "轮端", "液压泵", "视频", "声音"))) missing.add("异响部位和触发动作")
+        }
+        FieldFaultCategory.EMERGENCY_STOP -> {
+            if (!containsAny(allText, listOf("重启", "掉电", "急停", "接插件", "控制器", "故障码"))) missing.add("急停发生时状态和故障码")
+        }
+        null -> suggestions.add("建议补充故障类别，便于端侧检查清单更准确")
+    }
+
+    val score = (100 - missing.size * 12 - suggestions.size * 5).coerceIn(35, 100)
+    val level = when {
+        score >= 85 -> "可提交"
+        score >= 70 -> "建议补充"
+        else -> "信息不足"
+    }
+    return WorkOrderQualityReview(
+        score = score,
+        level = level,
+        missingItems = missing.distinct().take(6),
+        suggestions = suggestions.distinct().take(5),
+        strengths = strengths.distinct().take(4),
+    )
+}
+
+private fun containsAny(text: String, keywords: List<String>): Boolean {
+    return keywords.any { keyword -> text.contains(keyword, ignoreCase = true) }
+}
+
+private fun buildWorkOrderFollowUpContext(
+    userText: String,
+    aiText: String,
+    report: DiagnosticReport? = null,
+): String {
+    report?.let {
+        return buildString {
+            if (userText.isNotBlank()) appendLine("用户原始问题：$userText")
+            appendLine("已锁定的知识图谱诊断：")
+            appendLine(buildGraphFactLockText(it))
+            parseLlmReport(aiText)?.let { llm ->
+                if (llm.diagnosisBasis.isNotEmpty()) appendLine("端侧推理依据：${llm.diagnosisBasis.joinToString("；")}")
+                if (llm.followUpQuestions.isNotEmpty()) appendLine("待补充问题：${llm.followUpQuestions.joinToString("；")}")
+                llm.riskNote.takeIf { note -> note.isNotBlank() }?.let { note -> appendLine("风险提示：$note") }
+                llm.temporaryAction.takeIf { action -> action.isNotBlank() }?.let { action -> appendLine("临时处置：$action") }
+            }
+        }.trim()
+    }
+
+    parseLlmReport(aiText)?.let { llm ->
+        return buildString {
+            if (userText.isNotBlank()) appendLine("用户原始问题：$userText")
+            appendLine("设备：${llm.equipment}")
+            if (llm.location.isNotBlank()) appendLine("位置：${llm.location}")
+            appendLine("症状：${llm.symptom}")
+            if (llm.severity.isNotBlank()) appendLine("严重度：${llm.severity}")
+            if (llm.causes.isNotEmpty()) appendLine("可能原因：${llm.causes.joinToString("；") { "${it.first} ${it.second}%" }}")
+            if (llm.parts.isNotEmpty()) appendLine("备件：${llm.parts.joinToString("；") { part -> listOf(part.first, part.second, part.third).filter { it.isNotBlank() }.joinToString(" / ") }}")
+            if (llm.steps.isNotEmpty()) appendLine("步骤：${llm.steps.joinToString(" -> ") { it.first }}")
+            if (llm.diagnosisBasis.isNotEmpty()) appendLine("推理依据：${llm.diagnosisBasis.joinToString("；")}")
+            if (llm.followUpQuestions.isNotEmpty()) appendLine("待补充问题：${llm.followUpQuestions.joinToString("；")}")
+            if (llm.riskNote.isNotBlank()) appendLine("风险提示：${llm.riskNote}")
+            if (llm.temporaryAction.isNotBlank()) appendLine("临时处置：${llm.temporaryAction}")
+        }.trim()
+    }
+
+    return buildString {
+        if (userText.isNotBlank()) appendLine("用户原始问题：$userText")
+        appendLine(aiText.take(2200))
+    }.trim()
+}
+
+private fun shouldTreatAsWorkOrderFollowUp(userInput: String, workOrderContext: String): Boolean {
+    if (workOrderContext.isBlank()) return false
+    val text = userInput.trim()
+    if (text.isBlank()) return false
+    if (isExplicitNewDiagnosisRequest(text)) return false
+    val followUpSignals =
+        listOf("补充", "回答", "追问", "工单", "报警", "故障码", "参数", "电压", "温度", "压力", "声音", "异响", "位置", "时间", "有", "没有", "是", "不是")
+    return followUpSignals.any { text.contains(it) } || text.length <= 80
+}
+
+private fun isExplicitNewDiagnosisRequest(text: String): Boolean {
+    val normalized = text.trim()
+    val restartSignals = listOf("新诊断", "重新诊断", "重新分析", "换一台", "另一台", "另一个故障", "新的故障")
+    if (restartSignals.any { normalized.contains(it) }) return true
+    val explicitEquipment = extractExplicitEquipmentMention(normalized) != null
+    val knownSymptom = SYMPTOM_KEYWORDS.any { normalized.contains(it) }
+    val diagnosticIntent =
+        listOf(
+            "诊断", "故障", "原因", "怎么修", "怎么处理", "无法", "异常", "失灵", "泄漏",
+            "维修建议", "处理建议", "排查建议", "维修方案", "维修", "建议",
+        ).any { normalized.contains(it) }
+    return (explicitEquipment && (knownSymptom || diagnosticIntent)) || (knownSymptom && diagnosticIntent)
+}
+
+private fun isFollowUpQuestion(text: String): Boolean {
+    val normalized = text.trim()
+    if (normalized.endsWith("?") || normalized.endsWith("？")) return true
+    return listOf("为什么", "怎么", "如何", "是否", "能不能", "能否", "会不会", "是不是", "要不要", "需要", "可以", "影响", "导致", "说明什么", "先查", "还要", "吗", "呢").any { normalized.contains(it) }
+}
+
+private fun buildWorkOrderFollowUpModeInstruction(userInput: String): String {
+    return if (isFollowUpQuestion(userInput)) {
+        """
+        当前是追问，不是补充记录。
+        回答要求：
+        - 可以展开为6到10行，必须直接回答“会不会/要不要/先查什么”等判断。
+        - 不要复述整份工单，不要逐项重列设备、症状、原因、步骤。
+        - 结构建议：结论、为什么、对当前排查优先级的影响、下一步验证、需要补充的数据。
+        """.trimIndent()
+    } else {
+        """
+        当前是现场补充，不是新诊断。
+        回答要求：
+        - 不要只说“已记录”，必须说明这条补充信息的诊断意义。
+        - 可以展开为5到8行，解释它更支持哪类原因、会降低哪类可能、下一步该怎么验证。
+        - 可以提示应更新到工单哪个字段，但不要把回答写成固定模板。
+        """.trimIndent()
+    }
+}
+
+private fun inferWorkOrderUpdateField(text: String): String {
+    return when {
+        listOf("故障码", "报警码", "报警", "E", "P0", "DTC").any { text.contains(it, ignoreCase = true) } -> "故障摘要 / 故障码备注"
+        listOf("电压", "电流", "温度", "压力", "转速", "液位", "参数").any { text.contains(it) } -> "现场检测参数"
+        listOf("声音", "异响", "抖动", "气味", "漏油", "泄漏").any { text.contains(it) } -> "故障现象补充"
+        listOf("时间", "频率", "偶发", "一直", "启动", "行走", "举升", "制动").any { text.contains(it) } -> "发生工况 / 触发条件"
+        listOf("人员", "师傅", "维修", "备件", "库存").any { text.contains(it) } -> "维修安排 / 备件信息"
+        else -> "工单备注"
+    }
+}
+
+private fun inferWorkOrderSupplementImpact(text: String): String {
+    return when {
+        listOf("电压", "低压", "欠压", "9.", "10.").any { text.contains(it) } -> "优先核对电源、电池和接插件状态，避免误判为机械故障。"
+        listOf("压力", "液压", "漏油", "泄漏").any { text.contains(it) } -> "会提高液压系统方向的排查优先级。"
+        listOf("温度", "过热", "高温").any { text.contains(it) } -> "需要同步检查冷却、润滑和负载工况。"
+        listOf("故障码", "报警码", "报警", "E", "P0", "DTC").any { text.contains(it, ignoreCase = true) } -> "故障码可作为下一步验证依据，应和控制器数据一起记录。"
+        else -> "作为当前工单的补充证据，不触发重新生成诊断。"
+    }
+}
+
+private fun inferWorkOrderNextStep(text: String, workOrderContext: String): String {
+    return when {
+        listOf("故障码", "报警码", "报警", "E", "P0", "DTC").any { text.contains(it, ignoreCase = true) } -> "拍照或导出控制器故障码，并核对维修手册中的码义。"
+        listOf("电压", "电流").any { text.contains(it) } -> "复测静态和带载电压，记录测量位置与时间。"
+        listOf("压力", "液压").any { text.contains(it) } -> "按工单步骤复测液压压力，并检查油液和滤芯状态。"
+        listOf("温度", "过热").any { text.contains(it) } -> "记录温度变化曲线，先确认散热和负载条件。"
+        workOrderContext.contains("待补充问题") -> "继续补齐工单里的待补充问题，再决定是否调整维修步骤。"
+        else -> "保存为工单备注，现场复核后再更新处理结论。"
+    }
+}
+
+private fun compactWorkOrderFollowUpContext(context: String): String {
+    val preferredPrefixes = listOf("设备：", "位置：", "症状：", "严重度：", "图谱原因：", "图谱步骤：", "待补充问题：", "风险提示：", "临时处置：")
+    val lines = context
+        .lineSequence()
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .filter { line -> preferredPrefixes.any { line.startsWith(it) } }
+        .distinct()
+        .take(10)
+        .toList()
+    return (if (lines.isNotEmpty()) lines.joinToString("\n") else context.take(900)).take(1200)
+}
+
+private fun sanitizeWorkOrderFollowUpReply(rawText: String, userInput: String, workOrderContext: String): String {
+    val maxLines = if (isFollowUpQuestion(userInput)) 10 else 8
+    val contextLines = workOrderContext
+        .lineSequence()
+        .map { it.trim() }
+        .filter { it.length >= 6 }
+        .toSet()
+    val blockedPrefixes = listOf("设备：", "位置：", "症状：", "严重度：", "图谱原因：", "图谱步骤：", "相似工单：")
+    val cleanedLines = rawText
+        .lineSequence()
+        .map { it.trim().trimStart('-', ' ', '•') }
+        .filter { it.isNotBlank() }
+        .filterNot { it in contextLines }
+        .filterNot { line -> blockedPrefixes.any { line.startsWith(it) } }
+        .distinct()
+        .take(maxLines)
+        .toList()
+    val cleaned = cleanedLines.joinToString("\n").trim()
+    if (cleaned.isNotBlank()) return cleaned
+    return buildWorkOrderFollowUpFallback(userInput, workOrderContext)
+}
+
+private fun buildWorkOrderFollowUpFallback(userInput: String, workOrderContext: String): String {
+    val updateField = inferWorkOrderUpdateField(userInput)
+    val impact = inferWorkOrderSupplementImpact(userInput)
+    val nextStep = inferWorkOrderNextStep(userInput, workOrderContext)
+    return listOf(
+        "结论：这条信息会作为当前工单的新证据，不需要重新生成工单。",
+        "诊断意义：$impact",
+        "工单更新：建议写入“$updateField”。",
+        "下一步：$nextStep",
+    ).joinToString("\n")
 }
 
 private const val WORK_ORDER_QUEUE_FILE = "work_order_submit_queue.json"
@@ -1246,17 +2111,26 @@ private fun loadHistory(context: Context): MutableList<HistoryEntry> {
         if (!file.exists()) return mutableListOf()
         val type = object : TypeToken<List<HistoryEntry>>() {}.type
         historyGson.fromJson<List<HistoryEntry>>(file.readText(), type)?.toMutableList() ?: mutableListOf()
-    } catch (e: Exception) { Log.e(TAG, "Failed to load history", e); mutableListOf() }
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to load history", e)
+        mutableListOf()
+    }
 }
 
 private fun saveHistory(context: Context, history: List<HistoryEntry>) {
-    try { File(context.filesDir, HISTORY_FILE).writeText(historyGson.toJson(history)) }
-    catch (e: Exception) { Log.e(TAG, "Failed to save history", e) }
+    try {
+        File(context.filesDir, HISTORY_FILE).writeText(historyGson.toJson(history))
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to save history", e)
+    }
 }
 
 private fun clearHistory(context: Context) {
-    try { File(context.filesDir, HISTORY_FILE).delete() }
-    catch (e: Exception) { Log.e(TAG, "Failed to clear history", e) }
+    try {
+        File(context.filesDir, HISTORY_FILE).delete()
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to clear history", e)
+    }
 }
 
 // Chat message model (independent of Gallery)
@@ -1268,6 +2142,13 @@ data class PocketMessage(
     val isImageResponse: Boolean = false,
     val relatedWorkOrders: List<GraphNode> = emptyList(),
     val graphJson: String = "",
+    val sourceLabel: String = "",
+    val elapsedMs: Long = 0L,
+    val isEdgeReasoning: Boolean = false,
+    val isFollowUpResponse: Boolean = false,
+    val isFieldAssistResponse: Boolean = false,
+    val checklist: FieldChecklist? = null,
+    val canGenerateWorkOrder: Boolean = false,
 )
 
 class PocketOpsActivity : ComponentActivity() {
@@ -1564,6 +2445,8 @@ fun PocketOpsApp(
     var latestVisualContextText by remember { mutableStateOf("") }
     var latestVisualEquipmentContext by remember { mutableStateOf<GraphNode?>(null) }
     var visualLookupScopeActive by remember { mutableStateOf(false) }
+    var workOrderFollowUpContext by remember { mutableStateOf("") }
+    var activeOfflineTriageContext by remember { mutableStateOf<OfflineTriageContext?>(null) }
     val listState = rememberLazyListState()
     var showBluetoothDialog by remember { mutableStateOf(false) }
     var selectedWorkOrderMessage by remember { mutableStateOf<PocketMessage?>(null) }
@@ -1573,6 +2456,11 @@ fun PocketOpsApp(
     val queuedWorkOrders = remember { mutableStateListOf<QueuedWorkOrderSubmission>() }
     var isSubmittingQueuedWorkOrders by remember { mutableStateOf(false) }
     var showClearQueuedWorkOrdersDialog by remember { mutableStateOf(false) }
+    var showCloudWorkOrdersSheet by remember { mutableStateOf(false) }
+    var isLoadingCloudWorkOrders by remember { mutableStateOf(false) }
+    var cloudWorkOrdersError by remember { mutableStateOf<String?>(null) }
+    val cloudWorkOrders = remember { mutableStateListOf<DemoSubmittedWorkOrder>() }
+    var edgeDeepDiagnosisEnabled by remember { mutableStateOf(true) }
     var needsModelDirectoryAccess by remember { mutableStateOf(false) }
     var syncSummary by remember { mutableStateOf("") }
     var remoteBootstrapState by remember { mutableStateOf(RemoteBootstrapState.NOT_CONFIGURED) }
@@ -1782,10 +2670,8 @@ fun PocketOpsApp(
                                 connectTimeout = 2000
                                 readTimeout = 2000
                             }
-                            val code = conn.responseCode
-                            val body = conn.inputStream.bufferedReader().readText()
-                            conn.disconnect()
-                            if (code == 200 && isGenieApiServiceReady(body)) {
+                            val response = try { conn.readTextResponse() } finally { conn.disconnect() }
+                            if (response.code == 200 && isGenieApiServiceReady(response.body)) {
                                 Log.d(TAG, "Service ready after ${i}s")
                                 ready = true
                                 break
@@ -1830,70 +2716,121 @@ fun PocketOpsApp(
         if (isSubmittingQueuedWorkOrders || queuedWorkOrders.isEmpty()) return
         isSubmittingQueuedWorkOrders = true
         scope.launch {
-            val workingQueue = queuedWorkOrders.toMutableList()
-            var sessionForSubmit = session
-            var credentialError: String? = null
-            if (sessionForSubmit.accessToken.isBlank() && demoServerBaseUrl.isNotBlank()) {
-                val savedCredentials = withContext(Dispatchers.IO) { loadSavedLoginCredentials(context) }
-                if (savedCredentials.username.isBlank() || savedCredentials.password.isBlank()) {
-                    credentialError = "当前是离线登录，且未保存密码；请退出后在联网状态重新登录，或勾选记住密码后再提交。"
-                } else {
-                    runCatching {
-                        withContext(Dispatchers.IO) {
-                            authenticatePocketOpsUser(
-                                baseUrl = demoServerBaseUrl,
-                                username = savedCredentials.username,
-                                password = savedCredentials.password,
-                            )
+            var submittedCount = 0
+            var submitError: String? = null
+            try {
+                val workingQueue = queuedWorkOrders.toMutableList()
+                var sessionForSubmit = session
+                var credentialError: String? = null
+                if (sessionForSubmit.accessToken.isBlank() && demoServerBaseUrl.isNotBlank()) {
+                    val savedCredentials = withContext(Dispatchers.IO) { loadSavedLoginCredentials(context) }
+                    if (savedCredentials.username.isBlank() || savedCredentials.password.isBlank()) {
+                        credentialError = "当前是离线登录，且未保存密码；请退出后在联网状态重新登录，或勾选记住密码后再提交。"
+                    } else {
+                        runCatching {
+                            withContext(Dispatchers.IO) {
+                                authenticatePocketOpsUser(
+                                    baseUrl = demoServerBaseUrl,
+                                    username = savedCredentials.username,
+                                    password = savedCredentials.password,
+                                )
+                            }
+                        }.onSuccess { refreshedSession ->
+                            if (refreshedSession.accessToken.isNotBlank()) {
+                                sessionForSubmit = refreshedSession
+                                onSessionUpdated(refreshedSession)
+                            } else {
+                                credentialError = "电脑服务仍不可用，工单已保留在本机待提交队列。"
+                            }
+                        }.onFailure { error ->
+                            credentialError = error.message ?: "重新获取提交凭证失败"
                         }
-                    }.onSuccess { refreshedSession ->
-                        if (refreshedSession.accessToken.isNotBlank()) {
-                            sessionForSubmit = refreshedSession
-                            onSessionUpdated(refreshedSession)
-                        } else {
-                            credentialError = "电脑服务仍不可用，工单已保留在本机待提交队列。"
-                        }
-                    }.onFailure { error ->
-                        credentialError = error.message ?: "重新获取提交凭证失败"
                     }
                 }
-            }
 
-            val (submittedCount, error) = if (credentialError == null) {
-                withContext(Dispatchers.IO) {
-                    flushQueuedWorkOrders(
-                        context = context,
-                        queue = workingQueue,
-                        baseUrl = demoServerBaseUrl,
-                        accessToken = sessionForSubmit.accessToken,
-                        onQueueChanged = {},
-                    )
+                val result = if (credentialError == null) {
+                    withContext(Dispatchers.IO) {
+                        flushQueuedWorkOrders(
+                            context = context,
+                            queue = workingQueue,
+                            baseUrl = demoServerBaseUrl,
+                            accessToken = sessionForSubmit.accessToken,
+                            onQueueChanged = {},
+                        )
+                    }
+                } else {
+                    0 to credentialError
                 }
-            } else {
-                0 to credentialError
-            }
-            queuedWorkOrders.clear()
-            queuedWorkOrders.addAll(workingQueue)
-            isSubmittingQueuedWorkOrders = false
-            if (showToast || submittedCount > 0) {
-                val message = when {
-                    submittedCount > 0 && queuedWorkOrders.isEmpty() -> "已提交 $submittedCount 个待提交工单"
-                    submittedCount > 0 -> "已提交 $submittedCount 个工单，仍有 ${queuedWorkOrders.size} 个待提交"
-                    error != null -> error
-                    else -> "没有可提交的工单"
+                submittedCount = result.first
+                submitError = result.second
+                queuedWorkOrders.clear()
+                queuedWorkOrders.addAll(workingQueue)
+            } catch (e: Exception) {
+                submitError = e.message ?: "提交待办工单失败"
+            } finally {
+                isSubmittingQueuedWorkOrders = false
+                if (showToast || submittedCount > 0 || submitError != null) {
+                    val message = when {
+                        submittedCount > 0 && queuedWorkOrders.isEmpty() -> "已提交 $submittedCount 个待提交工单"
+                        submittedCount > 0 -> "已提交 $submittedCount 个工单，仍有 ${queuedWorkOrders.size} 个待提交"
+                        submitError != null -> submitError ?: "提交待办工单失败"
+                        else -> "没有可提交的工单"
+                    }
+                    Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
                 }
-                Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
             }
         }
     }
 
     fun clearQueuedWorkOrderQueue(showToast: Boolean = true) {
-        if (queuedWorkOrders.isEmpty()) return
         val removedCount = queuedWorkOrders.size
-        clearQueuedWorkOrders(context, queuedWorkOrders)
+        if (removedCount > 0) {
+            clearQueuedWorkOrders(context, queuedWorkOrders)
+        }
         showClearQueuedWorkOrdersDialog = false
-        if (showToast) {
+        if (showToast && removedCount > 0) {
             Toast.makeText(context, "已清除 $removedCount 个待提交工单", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun loadCloudWorkOrders() {
+        if (isLoadingCloudWorkOrders) return
+        showCloudWorkOrdersSheet = true
+        isLoadingCloudWorkOrders = true
+        cloudWorkOrdersError = null
+        scope.launch {
+            try {
+                var sessionForQuery = session
+                if (sessionForQuery.accessToken.isBlank() && demoServerBaseUrl.isNotBlank()) {
+                    val savedCredentials = withContext(Dispatchers.IO) { loadSavedLoginCredentials(context) }
+                    if (savedCredentials.username.isBlank() || savedCredentials.password.isBlank()) {
+                        throw IllegalStateException("当前是离线登录，且未保存密码；请先在线登录后再查看云端工单。")
+                    }
+                    sessionForQuery = withContext(Dispatchers.IO) {
+                        authenticatePocketOpsUser(
+                            baseUrl = demoServerBaseUrl,
+                            username = savedCredentials.username,
+                            password = savedCredentials.password,
+                        )
+                    }
+                    if (sessionForQuery.accessToken.isBlank()) {
+                        throw IllegalStateException("电脑服务仍不可用，请先在线登录后再查看云端工单。")
+                    }
+                    onSessionUpdated(sessionForQuery)
+                }
+                val records = withContext(Dispatchers.IO) {
+                    fetchSubmittedDemoWorkOrders(
+                        baseUrl = demoServerBaseUrl,
+                        accessToken = sessionForQuery.accessToken,
+                    )
+                }
+                cloudWorkOrders.clear()
+                cloudWorkOrders.addAll(records)
+            } catch (e: Exception) {
+                cloudWorkOrdersError = e.message ?: "云端工单不可用"
+            } finally {
+                isLoadingCloudWorkOrders = false
+            }
         }
     }
 
@@ -1912,7 +2849,8 @@ fun PocketOpsApp(
         val isWorkOrder = userText.contains("工单") || aiText.startsWith("工单号：")
         val entry = HistoryEntry(System.currentTimeMillis(), userText, aiText, isGraphRAG, isImage, isVideo, isWorkOrder)
         diagnosisHistory.add(entry)
-        scope.launch(Dispatchers.IO) { saveHistory(context, diagnosisHistory.toList()) }
+        val historySnapshot = diagnosisHistory.toList()
+        scope.launch(Dispatchers.IO) { saveHistory(context, historySnapshot) }
     }
 
     fun clearDiagnosisContextAfterWorkOrder() {
@@ -1921,6 +2859,243 @@ fun PocketOpsApp(
         latestVisualContextText = ""
         latestVisualEquipmentContext = null
         visualLookupScopeActive = false
+        activeOfflineTriageContext = null
+    }
+
+    fun resetWorkOrderFollowUpContext() {
+        workOrderFollowUpContext = ""
+    }
+
+    fun resetOfflineTriageContext() {
+        activeOfflineTriageContext = null
+    }
+
+    fun rememberWorkOrderFollowUpContext(userText: String, aiText: String, report: DiagnosticReport? = null) {
+        workOrderFollowUpContext = buildWorkOrderFollowUpContext(userText, aiText, report)
+    }
+
+    suspend fun streamVisualFollowUpReply(userText: String): String {
+        val contextText = latestVisualContextText.ifBlank { "暂无上一轮图片或视频分析摘要。" }
+        val source = if (contextText.contains("[用户发送了视频")) "视频上下文追问" else "图片上下文追问"
+        val canGenerate = isDiagnosticWorkOrderIntent(userText)
+        withContext(Dispatchers.Main) {
+            messages.add(
+                PocketMessage(
+                    text = "正在结合上一轮现场画面回答...",
+                    isUser = false,
+                    sourceLabel = source,
+                    isImageResponse = true,
+                    canGenerateWorkOrder = canGenerate,
+                ),
+            )
+        }
+
+        val httpMessages = org.json.JSONArray().apply {
+            put(
+                org.json.JSONObject()
+                    .put("role", "system")
+                    .put("content", VISUAL_FOLLOW_UP_PROMPT),
+            )
+            put(
+                org.json.JSONObject()
+                    .put("role", "user")
+                    .put(
+                        "content",
+                        "上一轮视觉分析摘要：\n${contextText.take(2200)}\n\n用户本轮追问：$userText",
+                    ),
+            )
+        }
+
+        val reqJson = org.json.JSONObject().apply {
+            put("model", "qwen2.5vl-3b-8850-2.42")
+            put("stream", true)
+            put("messages", httpMessages)
+            put("size", 1536)
+            put("temp", 0.1)
+            put("top_k", 1)
+            put("top_p", 1.0)
+        }
+
+        val t0 = System.currentTimeMillis()
+        clearGenieChatState()
+        val httpConn = (java.net.URL("http://127.0.0.1:8910/v1/chat/completions").openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json")
+            doOutput = true
+            connectTimeout = 10000
+            readTimeout = 90000
+        }
+        httpConn.outputStream.use { it.write(reqJson.toString().toByteArray(Charsets.UTF_8)) }
+
+        val httpCode = httpConn.responseCode
+        if (httpCode !in 200..299) {
+            val err = try { httpConn.readErrorBody() } finally { httpConn.disconnect() }
+            throw IllegalStateException(buildHttpErrorMessage("图片追问推理失败", httpCode, err))
+        }
+
+        val fullContent = StringBuilder()
+        try {
+            val reader = httpConn.inputStream.bufferedReader()
+            try {
+                var line: String?
+                while (reader.readLine().also { line = it } != null) {
+                    val l = line ?: continue
+                    if (!l.startsWith("data: ")) continue
+                    val data = l.removePrefix("data: ").trim()
+                    if (data == "[DONE]") break
+                    try {
+                        val delta = org.json.JSONObject(data).getJSONArray("choices").getJSONObject(0).getJSONObject("delta")
+                        if (delta.has("content")) {
+                            fullContent.append(delta.getString("content"))
+                            val content = fullContent.toString()
+                            withContext(Dispatchers.Main) {
+                                val idx = messages.size - 1
+                                if (idx >= 0) {
+                                    messages[idx] = messages[idx].copy(
+                                        text = content,
+                                        sourceLabel = source,
+                                        isImageResponse = true,
+                                        canGenerateWorkOrder = canGenerate,
+                                    )
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            } finally {
+                reader.close()
+            }
+        } finally {
+            httpConn.disconnect()
+        }
+
+        val content = fullContent.toString().trim().ifBlank { "上一轮图片信息不足，建议补拍设备编号、故障部位和仪表参数后再判断。" }
+        val elapsed = System.currentTimeMillis() - t0
+        withContext(Dispatchers.Main) {
+            val idx = messages.size - 1
+            if (idx >= 0) {
+                messages[idx] = messages[idx].copy(
+                    text = content,
+                    sourceLabel = source,
+                    elapsedMs = elapsed,
+                    isImageResponse = true,
+                    canGenerateWorkOrder = canGenerate,
+                )
+            }
+        }
+        return content
+    }
+
+    suspend fun streamWorkOrderFollowUpReply(userText: String): String {
+        val contextText = workOrderFollowUpContext.ifBlank { "暂无已锁定的工单上下文，请只回答本轮问题，不要生成新诊断。" }
+        withContext(Dispatchers.Main) {
+            messages.add(
+                PocketMessage(
+                    text = "正在分析这条补充/追问对当前工单的诊断意义...",
+                    isUser = false,
+                    sourceLabel = "工单后续沟通",
+                    isFollowUpResponse = true,
+                ),
+            )
+        }
+
+        val compactContext = compactWorkOrderFollowUpContext(contextText)
+        val modeInstruction = buildWorkOrderFollowUpModeInstruction(userText)
+        val httpMessages = org.json.JSONArray().apply {
+            put(
+                org.json.JSONObject()
+                    .put("role", "system")
+                    .put(
+                        "content",
+                        "$WORK_ORDER_FOLLOW_UP_PROMPT\n\n$modeInstruction\n\n压缩后的当前工单事实，仅用于回答本轮问题，禁止复述：\n$compactContext",
+                    ),
+            )
+            put(org.json.JSONObject().put("role", "user").put("content", "本轮新增问题：$userText"))
+        }
+
+        val reqJson = org.json.JSONObject().apply {
+            put("model", "qwen2.5vl-3b-8850-2.42")
+            put("stream", true)
+            put("messages", httpMessages)
+            put("size", 2048)
+            put("temp", 0.2)
+            put("top_k", 1)
+            put("top_p", 1.0)
+        }
+
+        val t0 = System.currentTimeMillis()
+        clearGenieChatState()
+        val httpConn = (java.net.URL("http://127.0.0.1:8910/v1/chat/completions").openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json")
+            doOutput = true
+            connectTimeout = 10000
+            readTimeout = 120000
+        }
+        httpConn.outputStream.use { it.write(reqJson.toString().toByteArray(Charsets.UTF_8)) }
+
+        val httpCode = httpConn.responseCode
+        if (httpCode !in 200..299) {
+            val err = try { httpConn.readErrorBody() } finally { httpConn.disconnect() }
+            throw IllegalStateException(buildHttpErrorMessage("工单后续推理失败", httpCode, err))
+        }
+
+        val fullContent = StringBuilder()
+        try {
+            val reader = httpConn.inputStream.bufferedReader()
+            try {
+                var line: String?
+                while (reader.readLine().also { line = it } != null) {
+                    val l = line ?: continue
+                    if (!l.startsWith("data: ")) continue
+                    val data = l.removePrefix("data: ").trim()
+                    if (data == "[DONE]") break
+                    try {
+                        val delta = org.json.JSONObject(data).getJSONArray("choices").getJSONObject(0).getJSONObject("delta")
+                        if (delta.has("content")) {
+                            fullContent.append(delta.getString("content"))
+                            val content = fullContent.toString()
+                            withContext(Dispatchers.Main) {
+                                val idx = messages.size - 1
+                                if (idx >= 0) {
+                                    messages[idx] = messages[idx].copy(
+                                        text = content,
+                                        sourceLabel = "工单后续沟通",
+                                        isFollowUpResponse = true,
+                                    )
+                                }
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            } finally {
+                reader.close()
+            }
+        } finally {
+            httpConn.disconnect()
+        }
+
+        val content =
+            sanitizeWorkOrderFollowUpReply(
+                rawText = fullContent.toString().ifBlank { "已收到补充信息，我会将其作为当前工单的后续备注；如需重新诊断，请输入新的设备和故障现象。" },
+                userInput = userText,
+                workOrderContext = contextText,
+            )
+        val elapsed = System.currentTimeMillis() - t0
+        withContext(Dispatchers.Main) {
+            val idx = messages.size - 1
+            if (idx >= 0) {
+                messages[idx] = messages[idx].copy(
+                    text = content,
+                    sourceLabel = "工单后续沟通",
+                    elapsedMs = elapsed,
+                    isFollowUpResponse = true,
+                )
+            }
+        }
+        return content
     }
 
     // Send logic — unified multi-turn with image / video context
@@ -1939,9 +3114,15 @@ fun PocketOpsApp(
         val explicitEquipmentMentionForTurn = extractExplicitEquipmentMention(userText)
         val explicitUnknownEquipmentForTurn =
             explicitEquipmentMentionForTurn != null && knowledgeGraph.findEquipment(userText).isEmpty()
+        val explicitNewDiagnosisForTurn = bitmap == null && videoUri == null && isExplicitNewDiagnosisRequest(userText)
 
         if (explicitUnknownEquipmentForTurn) {
             clearDiagnosisContextAfterWorkOrder()
+            resetWorkOrderFollowUpContext()
+            resetOfflineTriageContext()
+        } else if (explicitNewDiagnosisForTurn) {
+            resetWorkOrderFollowUpContext()
+            resetOfflineTriageContext()
         }
 
         val safeBitmap = bitmap?.let {
@@ -1955,6 +3136,78 @@ fun PocketOpsApp(
 
         scope.launch(Dispatchers.IO) {
             try {
+                if (bitmap == null && videoUri == null && !explicitNewDiagnosisForTurn && shouldTreatAsWorkOrderFollowUp(userText, workOrderFollowUpContext)) {
+                    val content = streamWorkOrderFollowUpReply(userText)
+                    conversationHistory.add("user" to userText)
+                    conversationHistory.add("assistant" to content)
+                    appendHistory(userText, content)
+                    return@launch
+                }
+
+                if (
+                    bitmap == null &&
+                    videoUri == null &&
+                    visualLookupScopeActive &&
+                    !explicitNewDiagnosisForTurn &&
+                    shouldTreatAsVisualFollowUp(userText, latestVisualContextText)
+                ) {
+                    val content = streamVisualFollowUpReply(userText)
+                    conversationHistory.add("user" to userText)
+                    conversationHistory.add("assistant" to content)
+                    appendHistory(userText, content, isImage = latestVisualContextText.contains("[用户发送了图片]"), isVideo = latestVisualContextText.contains("[用户发送了视频"))
+                    return@launch
+                }
+
+                if (bitmap == null && videoUri == null) {
+                    activeOfflineTriageContext?.takeIf { shouldTreatAsOfflineTriageFollowUp(userText, it) }?.let { triageContext ->
+                        val t0 = System.currentTimeMillis()
+                        val triageReply = buildOfflineTriageFollowUpReply(userText, triageContext)
+                        withContext(Dispatchers.Main) {
+                            activeOfflineTriageContext = triageReply.context
+                            messages.add(
+                                PocketMessage(
+                                    text = triageReply.text,
+                                    isUser = false,
+                                    sourceLabel = "端侧问诊排查",
+                                    elapsedMs = System.currentTimeMillis() - t0,
+                                    isFieldAssistResponse = true,
+                                    checklist = triageReply.checklist,
+                                ),
+                            )
+                        }
+                        conversationHistory.add("user" to userText)
+                        conversationHistory.add("assistant" to triageReply.text)
+                        appendHistory(userText, triageReply.text)
+                        return@launch
+                    }
+
+                    if (shouldStartOfflineTriage(userText, workOrderFollowUpContext)) {
+                        buildOfflineTriageQuestionnaire(userText)?.let { triageReply ->
+                            val t0 = System.currentTimeMillis()
+                            withContext(Dispatchers.Main) {
+                                activeOfflineTriageContext = triageReply.context
+                                messages.add(
+                                    PocketMessage(
+                                        text = triageReply.text,
+                                        isUser = false,
+                                        sourceLabel = "端侧问诊排查",
+                                        elapsedMs = System.currentTimeMillis() - t0,
+                                        isFieldAssistResponse = true,
+                                        checklist = triageReply.checklist,
+                                    ),
+                                )
+                            }
+                            conversationHistory.add("user" to userText)
+                            conversationHistory.add("assistant" to triageReply.text)
+                            appendHistory(userText, triageReply.text)
+                            return@launch
+                        }
+                    }
+                    withContext(Dispatchers.Main) {
+                        activeOfflineTriageContext = null
+                    }
+                }
+
                 var visualBitmap = safeBitmap
                 var visualSystemPrompt = IMAGE_SYSTEM_PROMPT
                 var visualQuestion = "请用中文回答。$userText"
@@ -1963,7 +3216,15 @@ fun PocketOpsApp(
 
                 if (videoUri != null) {
                     withContext(Dispatchers.Main) {
-                        messages.add(PocketMessage(text = "\u6b63\u5728\u4f7f\u7528\u7aef\u4fa7\u6a21\u578b\u5206\u6790\u89c6\u9891...", isUser = false, isImageResponse = true))
+                        messages.add(
+                            PocketMessage(
+                                text = "\u6b63\u5728\u4f7f\u7528\u7aef\u4fa7\u6a21\u578b\u5206\u6790\u89c6\u9891...",
+                                isUser = false,
+                                isImageResponse = true,
+                                sourceLabel = "视频诊断",
+                                canGenerateWorkOrder = true,
+                            ),
+                        )
                     }
 
                     val extractedFrames =
@@ -1992,10 +3253,20 @@ fun PocketOpsApp(
                         latestVisualContextText = ""
                         latestVisualEquipmentContext = null
                         visualLookupScopeActive = false
+                        resetWorkOrderFollowUpContext()
+                        resetOfflineTriageContext()
                     }
                     if (videoUri == null) {
                         withContext(Dispatchers.Main) {
-                            messages.add(PocketMessage(text = "\u6b63\u5728\u4f7f\u7528\u7aef\u4fa7\u6a21\u578b\u5206\u6790\u56fe\u7247...", isUser = false, isImageResponse = true))
+                            messages.add(
+                                PocketMessage(
+                                    text = "\u6b63\u5728\u4f7f\u7528\u7aef\u4fa7\u6a21\u578b\u5206\u6790\u56fe\u7247...",
+                                    isUser = false,
+                                    isImageResponse = true,
+                                    sourceLabel = "图片诊断",
+                                    canGenerateWorkOrder = true,
+                                ),
+                            )
                         }
                     }
 
@@ -2041,7 +3312,14 @@ fun PocketOpsApp(
 
                         withContext(Dispatchers.Main) {
                             val idx = messages.size - 1
-                            if (idx >= 0) messages[idx] = messages[idx].copy(text = content)
+                            if (idx >= 0) {
+                                messages[idx] = messages[idx].copy(
+                                    text = content,
+                                    sourceLabel = if (videoUri != null) "视频诊断" else "图片诊断",
+                                    isImageResponse = true,
+                                    canGenerateWorkOrder = true,
+                                )
+                            }
                             val matchedEquipment = knowledgeGraph.findEquipment(content).firstOrNull()
                             latestVisualContextText = "$visualHistoryLabel\n$content"
                             latestVisualEquipmentContext = matchedEquipment
@@ -2078,33 +3356,60 @@ fun PocketOpsApp(
                         buildEquipmentContextRetrievalText(userText, retrievalText, equipmentContextForTurn)
                     }
                 Log.d(TAG, "GraphRAG check: '${userText}', nodes=${knowledgeGraph.getNodeCount()}")
+                val graphT0 = System.currentTimeMillis()
                 val graphResult =
                     buildGraphRAGReport(userText, knowledgeGraph)
                         ?: buildGraphRAGReport(contextualRetrievalText, knowledgeGraph, equipmentContextForTurn)
                         ?: buildGraphRAGReport(retrievalText, knowledgeGraph)
+                val graphElapsedMs = System.currentTimeMillis() - graphT0
                 if (graphResult != null) {
                     val (report, graphJson) = graphResult
                     Log.d(TAG, "GraphRAG hit: ${report.equipment}")
-                    withContext(Dispatchers.Main) {
-                        messages.add(PocketMessage(text = "", isUser = false, report = report, graphJson = graphJson))
-                        activeEquipmentContext = report.equipment
-                        visualLookupScopeActive = false
+                    if (!edgeDeepDiagnosisEnabled) {
+                        withContext(Dispatchers.Main) {
+                            messages.add(
+                                PocketMessage(
+                                    text = "",
+                                    isUser = false,
+                                    report = report,
+                                    graphJson = graphJson,
+                                    sourceLabel = "图谱快答",
+                                    elapsedMs = graphElapsedMs,
+                                    relatedWorkOrders = report.workOrders,
+                                    checklist = buildFieldChecklistForDiagnosis(userText, graphReport = report),
+                                ),
+                            )
+                            activeEquipmentContext = report.equipment
+                            visualLookupScopeActive = false
+                        }
+                        conversationHistory.add("user" to userText)
+                        conversationHistory.add("assistant" to buildDiagnosticReportText(report))
+                        rememberWorkOrderFollowUpContext(userText, buildDiagnosticReportText(report), report)
+                        appendHistory(userText, buildDiagnosticReportText(report), isGraphRAG = true)
+                        return@launch
                     }
-                    conversationHistory.add("user" to userText)
-                    conversationHistory.add("assistant" to buildDiagnosticReportText(report))
-                    appendHistory(userText, buildDiagnosticReportText(report), isGraphRAG = true)
-                    return@launch
                 } else {
                     Log.d(TAG, "GraphRAG miss")
                 }
 
                 val equipmentLookupResult = buildEquipmentLookupAnswer(userText, contextualRetrievalText, knowledgeGraph)
-                if (equipmentLookupResult != null) {
+                if (equipmentLookupResult != null && graphResult == null) {
                     val (matchedEquipment, equipmentLookupAnswer) = equipmentLookupResult
+                    val lookupFromVisual = visualLookupScopeActive
                     withContext(Dispatchers.Main) {
-                        messages.add(PocketMessage(text = equipmentLookupAnswer, isUser = false))
+                        messages.add(
+                            PocketMessage(
+                                text = equipmentLookupAnswer,
+                                isUser = false,
+                                isImageResponse = lookupFromVisual,
+                                sourceLabel = if (lookupFromVisual) "图片上下文追问" else "",
+                            ),
+                        )
                         activeEquipmentContext = matchedEquipment
-                        visualLookupScopeActive = false
+                        if (lookupFromVisual) {
+                            latestVisualEquipmentContext = matchedEquipment
+                        }
+                        visualLookupScopeActive = lookupFromVisual
                     }
                     conversationHistory.add("user" to userText)
                     conversationHistory.add("assistant" to equipmentLookupAnswer)
@@ -2115,7 +3420,7 @@ fun PocketOpsApp(
                 if (isEquipmentLookupQuestion(userText) && visualLookupScopeActive) {
                     val answer = "最近一次图片或视频里暂未匹配到知识库中的具体叉车编号。请补拍包含设备编号、配置号或铭牌的画面，或直接输入设备编号。"
                     withContext(Dispatchers.Main) {
-                        messages.add(PocketMessage(text = answer, isUser = false))
+                        messages.add(PocketMessage(text = answer, isUser = false, isImageResponse = true, sourceLabel = "图片上下文追问"))
                     }
                     conversationHistory.add("user" to userText)
                     conversationHistory.add("assistant" to answer)
@@ -2123,59 +3428,135 @@ fun PocketOpsApp(
                     return@launch
                 }
 
-                explicitEquipmentMentionForTurn?.takeIf { explicitUnknownEquipmentForTurn }?.let { equipmentMention ->
-                    buildUnknownEquipmentSymptomReport(
-                        equipmentMention = equipmentMention,
-                        userInput = userText,
-                        graph = knowledgeGraph,
-                    )?.let { content ->
-                        withContext(Dispatchers.Main) {
-                            messages.add(PocketMessage(text = content, isUser = false))
-                            activeEquipmentContext = null
-                            latestVisualContextText = ""
-                            latestVisualEquipmentContext = null
-                            visualLookupScopeActive = false
+                if (!edgeDeepDiagnosisEnabled) {
+                    explicitEquipmentMentionForTurn?.takeIf { explicitUnknownEquipmentForTurn }?.let { equipmentMention ->
+                        buildUnknownEquipmentSymptomReport(
+                            equipmentMention = equipmentMention,
+                            userInput = userText,
+                            graph = knowledgeGraph,
+                        )?.let { content ->
+                            withContext(Dispatchers.Main) {
+                                messages.add(
+                                    PocketMessage(
+                                        text = content,
+                                        isUser = false,
+                                        sourceLabel = "症状参考快答",
+                                        elapsedMs = graphElapsedMs,
+                                        checklist = buildFieldChecklistForDiagnosis(userText, llmContent = content),
+                                    ),
+                                )
+                                activeEquipmentContext = null
+                                latestVisualContextText = ""
+                                latestVisualEquipmentContext = null
+                                visualLookupScopeActive = false
+                            }
+                            conversationHistory.add("user" to userText)
+                            conversationHistory.add("assistant" to content)
+                            appendHistory(userText, content)
+                            return@launch
                         }
-                        conversationHistory.add("user" to userText)
-                        conversationHistory.add("assistant" to content)
-                        appendHistory(userText, content)
-                        return@launch
                     }
                 }
 
                 // LLM query via HTTP (stream)
-                withContext(Dispatchers.Main) { messages.add(PocketMessage(text = "", isUser = false)) }
-
-                val ragContext =
+                val deepGraphReport = graphResult?.first
+                val deepGraphJson = graphResult?.second.orEmpty()
+                val deepGraphContext =
+                    deepGraphReport?.let { buildDeepGraphReasoningContext(userText, it, deepGraphJson, graphElapsedMs) }
+                val partialRagContext =
                     buildPartialRAGContext(userText, knowledgeGraph)
                         ?: buildPartialRAGContext(contextualRetrievalText, knowledgeGraph)
                         ?: buildPartialRAGContext(retrievalText, knowledgeGraph)
+                val knownSymptomMentioned =
+                    SYMPTOM_KEYWORDS.any { keyword ->
+                        userText.contains(keyword) || contextualRetrievalText.contains(keyword) || retrievalText.contains(keyword)
+                    }
+                val isUnknownSymptomFlow = graphResult == null && !knownSymptomMentioned
+                val responseSourceLabel =
+                    when {
+                        deepGraphContext != null -> "图谱增强 + 端侧推理"
+                        isUnknownSymptomFlow -> "知识库未命中 · 端侧泛化"
+                        else -> "端侧模型诊断"
+                    }
+                val placeholderText =
+                    when {
+                        deepGraphContext != null -> "正在用端侧模型结合图谱结果做深度诊断..."
+                        isUnknownSymptomFlow -> "知识库未直接命中，正在由端侧模型生成泛化诊断..."
+                        else -> ""
+                    }
+                withContext(Dispatchers.Main) {
+                    messages.add(
+                        PocketMessage(
+                            text = placeholderText,
+                            isUser = false,
+                            graphJson = deepGraphJson,
+                            sourceLabel = responseSourceLabel,
+                            isEdgeReasoning = true,
+                        ),
+                    )
+                    deepGraphReport?.let {
+                        activeEquipmentContext = it.equipment
+                    }
+                }
+
+                val ragContext =
+                    deepGraphContext
+                        ?: partialRagContext
                 val explicitUnknownEquipmentGuard =
                     explicitEquipmentMentionForTurn?.takeIf { explicitUnknownEquipmentForTurn }?.let { equipmentMention ->
                         "\n\n重要约束：用户本轮明确提到“$equipmentMention”，但知识库没有匹配到该设备。严禁沿用上一轮图片、视频或工单中的其他设备编号，尤其不要输出3号叉车等旧设备。equipment字段必须填写“$equipmentMention（知识库未收录）”，并提示需要补充设备档案；原因、备件和步骤只能作为通用参考。"
                     }.orEmpty()
-                val sysPrompt =
-                    if (ragContext != null) {
-                        SYSTEM_PROMPT + "\n\n" + ragContext + explicitUnknownEquipmentGuard
+                val modeInstruction =
+                    when {
+                        deepGraphContext != null -> "\n\n当前模式：端侧深度诊断。请在diagnosisBasis字段中写明你参考了图谱证据，并在followUpQuestions字段中列出需要现场补采的数据。"
+                        isUnknownSymptomFlow -> "\n\n当前模式：知识库未命中后的端侧泛化诊断。diagnosisBasis第一条必须包含“知识库未直接命中该症状”。"
+                        else -> ""
+                    }
+                val unknownSymptomContext =
+                    if (isUnknownSymptomFlow) {
+                        buildString {
+                            appendLine(buildUnknownSymptomReasoningContext(userText, explicitEquipmentMentionForTurn, knowledgeGraph))
+                            partialRagContext?.takeIf { it.isNotBlank() }?.let {
+                                appendLine()
+                                appendLine("已识别到的设备或会话上下文：")
+                                appendLine(it)
+                            }
+                        }
                     } else {
-                        SYSTEM_PROMPT + explicitUnknownEquipmentGuard
+                        null
+                    }
+                val sysPrompt =
+                    when {
+                        deepGraphContext != null ->
+                            EDGE_DEEP_DIAGNOSIS_PROMPT + "\n\n" + deepGraphContext + explicitUnknownEquipmentGuard + modeInstruction
+                        isUnknownSymptomFlow ->
+                            UNKNOWN_SYMPTOM_PROMPT + "\n\n" + unknownSymptomContext + explicitUnknownEquipmentGuard + modeInstruction
+                        ragContext != null ->
+                            SYSTEM_PROMPT + "\n\n请基于以下检索上下文补全诊断JSON；不得编造上下文没有支持的确定结论。\n" + ragContext + explicitUnknownEquipmentGuard + modeInstruction
+                        else ->
+                            UNKNOWN_SYMPTOM_PROMPT + "\n\n" + unknownSymptomContext + explicitUnknownEquipmentGuard + modeInstruction
                     }
 
                 val httpMessages = org.json.JSONArray().apply {
-                    put(org.json.JSONObject().put("role", "system").put("content", "你是工业叉车诊断助手，请用JSON格式回答。"))
-                    conversationHistory.takeLast(8).forEach { (role, content) ->
-                        if ((role == "user" || role == "assistant") && content.isNotBlank()) {
-                            put(org.json.JSONObject().put("role", role).put("content", content.take(1200)))
+                    put(org.json.JSONObject().put("role", "system").put("content", sysPrompt))
+                    if (deepGraphContext == null) {
+                        conversationHistory.takeLast(8).forEach { (role, content) ->
+                            if ((role == "user" || role == "assistant") && content.isNotBlank()) {
+                                put(org.json.JSONObject().put("role", role).put("content", content.take(1200)))
+                            }
                         }
                     }
-                    put(org.json.JSONObject().put("role", "user").put("content", "$sysPrompt\n\n$userText"))
+                    put(org.json.JSONObject().put("role", "user").put("content", userText))
                 }
 
                 val reqJson = org.json.JSONObject().apply {
                     put("model", "qwen2.5vl-3b-8850-2.42")
                     put("stream", true)
                     put("messages", httpMessages)
-                    put("size", 4096); put("temp", 0.0); put("top_k", 1); put("top_p", 1.0)
+                    put("size", if (deepGraphContext != null) 1024 else 4096)
+                    put("temp", 0.0)
+                    put("top_k", 1)
+                    put("top_p", 1.0)
                 }
 
                 val t0 = System.currentTimeMillis()
@@ -2188,7 +3569,7 @@ fun PocketOpsApp(
                     setRequestProperty("Content-Type", "application/json")
                     doOutput = true
                     connectTimeout = 10000
-                    readTimeout = 120000
+                    readTimeout = if (deepGraphContext != null) 45000 else 120000
                 }
                 httpConn.outputStream.use { it.write(reqJson.toString().toByteArray(Charsets.UTF_8)) }
 
@@ -2199,6 +3580,7 @@ fun PocketOpsApp(
                 }
 
                 val fullContent = StringBuilder()
+                var lastStreamUiUpdateAt = 0L
                 try {
                     val reader = httpConn.inputStream.bufferedReader()
                     try {
@@ -2213,12 +3595,26 @@ fun PocketOpsApp(
                                 if (delta.has("content")) {
                                     fullContent.append(delta.getString("content"))
                                     val text = fullContent.toString()
-                                    withContext(Dispatchers.Main) {
-                                        val idx = messages.size - 1
-                                        if (idx >= 0) messages[idx] = messages[idx].copy(text = text)
+                                    val now = System.currentTimeMillis()
+                                    val shouldUpdateStreamUi =
+                                        deepGraphReport == null || lastStreamUiUpdateAt == 0L || now - lastStreamUiUpdateAt >= 700L
+                                    if (shouldUpdateStreamUi) {
+                                        lastStreamUiUpdateAt = now
+                                        withContext(Dispatchers.Main) {
+                                            val idx = messages.size - 1
+                                            if (idx >= 0) {
+                                                messages[idx] = messages[idx].copy(
+                                                    text = deepGraphReport?.let { buildGraphGroundedProgressText(it) } ?: text,
+                                                    sourceLabel = responseSourceLabel,
+                                                    graphJson = deepGraphJson,
+                                                    isEdgeReasoning = true,
+                                                )
+                                            }
+                                        }
                                     }
                                 }
-                            } catch (_: Exception) {}
+                            } catch (_: Exception) {
+                            }
                         }
                     } finally {
                         reader.close()
@@ -2231,15 +3627,52 @@ fun PocketOpsApp(
                 val t1 = System.currentTimeMillis()
                 Log.d(TAG, "LLM done: ${t1 - t0}ms, len=${llmContent.length}, preview=${llmContent.take(200)}")
 
-                val relatedWOs = findRelatedWorkOrders(contextualRetrievalText, knowledgeGraph)
+                val finalLlmContent =
+                    when {
+                        deepGraphReport != null ->
+                            mergeGraphFactsWithEdgeReasoning(
+                                graphReport = deepGraphReport,
+                                reasoningText = llmContent,
+                                sourceLabel = responseSourceLabel,
+                            )
+                        llmContent.isBlank() ->
+                            buildLocalFallbackDiagnosisJson(
+                                userInput = userText,
+                                sourceLabel = responseSourceLabel,
+                                equipmentMention = explicitEquipmentMentionForTurn,
+                                graphReport = null,
+                                unknownSymptom = isUnknownSymptomFlow,
+                            )
+                        else -> llmContent
+                    }
+                val relatedWOs =
+                    deepGraphReport?.workOrders?.takeIf { it.isNotEmpty() }
+                        ?: findRelatedWorkOrders(contextualRetrievalText, knowledgeGraph)
+                val fieldChecklist =
+                    buildFieldChecklistForDiagnosis(
+                        userInput = userText,
+                        graphReport = deepGraphReport,
+                        llmContent = finalLlmContent,
+                    )
                 withContext(Dispatchers.Main) {
                     val idx = messages.size - 1
-                    if (idx >= 0) messages[idx] = messages[idx].copy(text = llmContent, relatedWorkOrders = relatedWOs)
+                    if (idx >= 0) {
+                        messages[idx] = messages[idx].copy(
+                            text = finalLlmContent,
+                            relatedWorkOrders = relatedWOs,
+                            sourceLabel = responseSourceLabel,
+                            elapsedMs = t1 - t0,
+                            graphJson = deepGraphJson,
+                            isEdgeReasoning = true,
+                            checklist = fieldChecklist,
+                        )
+                    }
                     visualLookupScopeActive = false
                 }
                 conversationHistory.add("user" to userText)
-                conversationHistory.add("assistant" to llmContent)
-                appendHistory(userText, llmContent)
+                conversationHistory.add("assistant" to finalLlmContent)
+                rememberWorkOrderFollowUpContext(userText, finalLlmContent, deepGraphReport)
+                appendHistory(userText, finalLlmContent)
 
             } catch (e: Exception) {
                 Log.e(TAG, "Query failed", e)
@@ -2284,26 +3717,34 @@ fun PocketOpsApp(
                     }
                     Spacer(Modifier.width(4.dp))
                     Box {
-                        var showQueueMenu by remember { mutableStateOf(false) }
+                        var showMoreMenu by remember { mutableStateOf(false) }
                         Box {
-                            ToolbarAction(icon = Icons.Default.CloudUpload, contentDescription = "提交待办工单") {
-                                if (queuedWorkOrders.isEmpty()) {
-                                    trySubmitQueuedWorkOrders(showToast = true)
-                                } else {
-                                    showQueueMenu = true
-                                }
+                            ToolbarAction(icon = Icons.Default.MoreVert, contentDescription = "更多") {
+                                showMoreMenu = true
                             }
                             DropdownMenu(
-                                expanded = showQueueMenu,
-                                onDismissRequest = { showQueueMenu = false },
+                                expanded = showMoreMenu,
+                                onDismissRequest = { showMoreMenu = false },
                             ) {
                                 DropdownMenuItem(
-                                    text = { Text("立即提交 ${queuedWorkOrders.size} 个工单") },
+                                    text = {
+                                        Text(
+                                            if (queuedWorkOrders.isEmpty()) "提交待办工单" else "立即提交 ${queuedWorkOrders.size} 个工单",
+                                        )
+                                    },
                                     leadingIcon = { Icon(Icons.Default.CloudUpload, null) },
                                     enabled = queuedWorkOrders.isNotEmpty() && !isSubmittingQueuedWorkOrders,
                                     onClick = {
-                                        showQueueMenu = false
+                                        showMoreMenu = false
                                         trySubmitQueuedWorkOrders(showToast = true)
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("查看云端工单") },
+                                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.Assignment, null) },
+                                    onClick = {
+                                        showMoreMenu = false
+                                        loadCloudWorkOrders()
                                     },
                                 )
                                 DropdownMenuItem(
@@ -2311,8 +3752,66 @@ fun PocketOpsApp(
                                     leadingIcon = { Icon(Icons.Default.DeleteSweep, null, tint = DangerColor) },
                                     enabled = queuedWorkOrders.isNotEmpty(),
                                     onClick = {
-                                        showQueueMenu = false
+                                        showMoreMenu = false
                                         showClearQueuedWorkOrdersDialog = true
+                                    },
+                                )
+                                HorizontalDivider(color = BorderSoft)
+                                DropdownMenuItem(
+                                    text = { Text("蓝牙诊断采集") },
+                                    leadingIcon = { Icon(Icons.Default.Bluetooth, null) },
+                                    onClick = {
+                                        showMoreMenu = false
+                                        showBluetoothDialog = true
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Column {
+                                            Text("端侧深度诊断")
+                                            Text(
+                                                if (edgeDeepDiagnosisEnabled) "命中图谱后继续调用本机模型推理" else "当前为图谱快答优先",
+                                                fontSize = 11.sp,
+                                                color = TextMuted,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            if (edgeDeepDiagnosisEnabled) Icons.Default.CheckCircle else Icons.Default.Memory,
+                                            null,
+                                            tint = if (edgeDeepDiagnosisEnabled) SuccessColor else TextMuted,
+                                        )
+                                    },
+                                    onClick = {
+                                        edgeDeepDiagnosisEnabled = !edgeDeepDiagnosisEnabled
+                                        showMoreMenu = false
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("电脑服务") },
+                                    leadingIcon = { Icon(Icons.Default.Storage, null) },
+                                    onClick = {
+                                        showMoreMenu = false
+                                        onConfigureServer()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("新会话") },
+                                    leadingIcon = { Icon(Icons.Default.Refresh, null) },
+                                    onClick = {
+                                        showMoreMenu = false
+                                        messages.clear()
+                                        conversationHistory.clear()
+                                        activeEquipmentContext = null
+                                        latestVisualContextText = ""
+                                        latestVisualEquipmentContext = null
+                                        visualLookupScopeActive = false
+                                        resetWorkOrderFollowUpContext()
+                                        resetOfflineTriageContext()
+                                        selectedWorkOrderMessage = null
                                     },
                                 )
                             }
@@ -2335,24 +3834,6 @@ fun PocketOpsApp(
                                 )
                             }
                         }
-                    }
-                    Spacer(Modifier.width(4.dp))
-                    ToolbarAction(icon = Icons.Default.Bluetooth, contentDescription = "蓝牙") {
-                        showBluetoothDialog = true
-                    }
-                    Spacer(Modifier.width(4.dp))
-                    ToolbarAction(icon = Icons.Default.Storage, contentDescription = "\u7535\u8111\u670d\u52a1") {
-                        onConfigureServer()
-                    }
-                    Spacer(Modifier.width(4.dp))
-                    ToolbarAction(icon = Icons.Default.Refresh, contentDescription = "新会话") {
-                        messages.clear()
-                        conversationHistory.clear()
-                        activeEquipmentContext = null
-                        latestVisualContextText = ""
-                        latestVisualEquipmentContext = null
-                        visualLookupScopeActive = false
-                        selectedWorkOrderMessage = null
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -2539,15 +4020,26 @@ fun PocketOpsApp(
                 // Chat area
                 Box(Modifier.weight(1f)) {
                     if (messages.isEmpty()) {
-                        EmptyState { text -> sendMessage(text, null, null) }
+                        EmptyState(edgeDeepDiagnosisEnabled = edgeDeepDiagnosisEnabled) { text -> sendMessage(text, null, null) }
                     } else {
                         LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                             items(messages) { msg ->
                                 MessageBubble(
                                     msg,
                                     onGenerateWorkOrder = {
-                                        selectedWorkOrderMessage = msg
+                                        selectedWorkOrderMessage =
+                                            buildDynamicWorkOrderMessage(
+                                                clickedMessage = msg,
+                                                messages = messages.toList(),
+                                                conversationHistory = conversationHistory.toList(),
+                                                latestVisualContextText = latestVisualContextText,
+                                                activeEquipmentContext = activeEquipmentContext,
+                                                graph = knowledgeGraph,
+                                            )
                                         clearDiagnosisContextAfterWorkOrder()
+                                        selectedWorkOrderMessage?.let { dynamicMessage ->
+                                            rememberWorkOrderFollowUpContext("", dynamicMessage.text, dynamicMessage.report)
+                                        }
                                     },
                                     onShowGraph = { if (msg.graphJson.isNotEmpty()) selectedGraphJson = msg.graphJson },
                                 )
@@ -2590,8 +4082,14 @@ fun PocketOpsApp(
             },
             onSubmitQueuedWorkOrders = { showToast -> trySubmitQueuedWorkOrders(showToast = showToast) },
             onRequestClearQueuedWorkOrders = { showClearQueuedWorkOrdersDialog = true },
-            onSaveRecord = { userText, aiText -> appendHistory(userText, aiText) },
-            onWorkOrderCompleted = { clearDiagnosisContextAfterWorkOrder() },
+            onSaveRecord = { userText, aiText ->
+                appendHistory(userText, aiText)
+                workOrderFollowUpContext = aiText
+            },
+            onWorkOrderCompleted = {
+                clearDiagnosisContextAfterWorkOrder()
+                rememberWorkOrderFollowUpContext("", workOrderMessage.text, workOrderMessage.report)
+            },
             onDismiss = { selectedWorkOrderMessage = null },
         )
     }
@@ -2614,6 +4112,16 @@ fun PocketOpsApp(
         )
     }
 
+    if (showCloudWorkOrdersSheet) {
+        CloudWorkOrdersSheet(
+            records = cloudWorkOrders,
+            isLoading = isLoadingCloudWorkOrders,
+            error = cloudWorkOrdersError,
+            onRefresh = { loadCloudWorkOrders() },
+            onDismiss = { showCloudWorkOrdersSheet = false },
+        )
+    }
+
     // Knowledge Graph Visualization
     selectedGraphJson?.let { json ->
         GraphVizSheet(graphJson = json, onDismiss = { selectedGraphJson = null })
@@ -2630,14 +4138,36 @@ fun PocketOpsApp(
                 showHistorySheet = false
             },
             onRestore = { entry ->
+                messages.clear()
+                conversationHistory.clear()
                 messages.add(PocketMessage(text = entry.userText, isUser = true))
-                messages.add(PocketMessage(text = entry.aiText, isUser = false))
+                messages.add(
+                    PocketMessage(
+                        text = entry.aiText,
+                        isUser = false,
+                        isImageResponse = entry.isImage || entry.isVideo,
+                        sourceLabel = when {
+                            entry.isVideo -> "视频历史"
+                            entry.isImage -> "图片历史"
+                            entry.isGraphRAG -> "图谱历史"
+                            entry.isWorkOrder -> "工单历史"
+                            else -> ""
+                        },
+                        checklist = buildFieldChecklistForDiagnosis(entry.userText, llmContent = entry.aiText),
+                    ),
+                )
                 conversationHistory.add("user" to entry.userText)
                 conversationHistory.add("assistant" to entry.aiText)
-                activeEquipmentContext = knowledgeGraph.findEquipment("${entry.userText}\n${entry.aiText}").firstOrNull() ?: activeEquipmentContext
+                activeEquipmentContext = knowledgeGraph.findEquipment("${entry.userText}\n${entry.aiText}").firstOrNull()
+                if (entry.isWorkOrder || entry.isGraphRAG || parseLlmReport(entry.aiText) != null) {
+                    workOrderFollowUpContext = buildWorkOrderFollowUpContext(entry.userText, entry.aiText)
+                } else {
+                    resetWorkOrderFollowUpContext()
+                }
                 latestVisualContextText = ""
                 latestVisualEquipmentContext = null
                 visualLookupScopeActive = false
+                resetOfflineTriageContext()
             },
         )
     }
@@ -2646,8 +4176,8 @@ fun PocketOpsApp(
 // ==================== Empty State ====================
 
 @Composable
-private fun EmptyState(onChipClick: (String) -> Unit) {
-    val chips = listOf("3号叉车举升缓慢", "5号叉车无法启动", "7号叉车转向沉重", "2号叉车发动机过热", "9号叉车异响")
+private fun EmptyState(edgeDeepDiagnosisEnabled: Boolean, onChipClick: (String) -> Unit) {
+    val chips = listOf("5号叉车无法启动", "3号叉车举升缓慢，请给出维修建议", "AGV搬运车偶发急停", "7号叉车转向沉重", "2号叉车发动机过热")
     Column(
         Modifier
             .fillMaxSize()
@@ -2670,10 +4200,14 @@ private fun EmptyState(onChipClick: (String) -> Unit) {
                     }
                 }
                 Spacer(Modifier.height(14.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     StatusChip("系统待命", SuccessSoft, SuccessColor)
                     StatusChip("\u56fe\u8c31\u8bca\u65ad", AccentSoft, Accent)
-                    StatusChip("可生成工单", SurfaceMuted, TextMuted)
+                    StatusChip(if (edgeDeepDiagnosisEnabled) "端侧深度推理" else "图谱快答优先", SurfaceMuted, TextMuted)
+                    StatusChip("问诊排查", SurfaceMuted, TextMuted)
                 }
                 Spacer(Modifier.height(16.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -2693,8 +4227,8 @@ private fun EmptyState(onChipClick: (String) -> Unit) {
                         shape = RoundedCornerShape(16.dp),
                     ) {
                         Column(Modifier.padding(14.dp)) {
-                            Text("3", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = TextMain)
-                            Text("诊断入口模式", fontSize = 12.sp, color = TextMuted)
+                            Text("4", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = TextMain)
+                            Text("端侧入口模式", fontSize = 12.sp, color = TextMuted)
                         }
                     }
                 }
@@ -2757,7 +4291,11 @@ private fun EmptyState(onChipClick: (String) -> Unit) {
 // ==================== Message Bubble ====================
 
 @Composable
-private fun MessageBubble(msg: PocketMessage, onGenerateWorkOrder: () -> Unit = {}, onShowGraph: () -> Unit = {}) {
+private fun MessageBubble(
+    msg: PocketMessage,
+    onGenerateWorkOrder: () -> Unit = {},
+    onShowGraph: () -> Unit = {},
+) {
     val screenW = LocalConfiguration.current.screenWidthDp.dp
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 3.dp),
@@ -2780,7 +4318,13 @@ private fun MessageBubble(msg: PocketMessage, onGenerateWorkOrder: () -> Unit = 
             }
             // Report card or text bubble
             if (msg.report != null) {
-                DiagnosticCard(msg.report, onGenerateWorkOrder, onShowGraph = { if (msg.graphJson.isNotEmpty()) onShowGraph() })
+                DiagnosticCard(
+                    r = msg.report,
+                    onGenerateWorkOrder = onGenerateWorkOrder,
+                    onShowGraph = { if (msg.graphJson.isNotEmpty()) onShowGraph() },
+                    sourceLabel = msg.sourceLabel,
+                    elapsedMs = msg.elapsedMs,
+                )
             } else if (msg.text.isNotEmpty()) {
                 if (msg.isUser) {
                     Surface(
@@ -2789,9 +4333,16 @@ private fun MessageBubble(msg: PocketMessage, onGenerateWorkOrder: () -> Unit = 
                     ) {
                         Text(msg.text, Modifier.padding(horizontal = 14.dp, vertical = 10.dp), color = Color.White, fontSize = 14.sp, lineHeight = 20.sp)
                     }
-                } else if (msg.text.length > 50 && !msg.isImageResponse) {
+                } else if (msg.text.length > 50 && !msg.isImageResponse && !msg.isFollowUpResponse && !msg.isFieldAssistResponse) {
                     // AI diagnosis response as structured card
-                    LlmDiagnosticCard(msg.text, onGenerateWorkOrder)
+                    LlmDiagnosticCard(
+                        text = msg.text,
+                        onGenerateWorkOrder = onGenerateWorkOrder,
+                        sourceLabel = msg.sourceLabel,
+                        elapsedMs = msg.elapsedMs,
+                        onShowGraph = { if (msg.graphJson.isNotEmpty()) onShowGraph() },
+                        hasGraph = msg.graphJson.isNotEmpty(),
+                    )
                 } else {
                     // Short AI response or image response as simple bubble
                     Surface(
@@ -2806,6 +4357,23 @@ private fun MessageBubble(msg: PocketMessage, onGenerateWorkOrder: () -> Unit = 
                             textColor = TextMain,
                         )
                     }
+                    if (msg.sourceLabel.isNotBlank() || msg.elapsedMs > 0L) {
+                        Spacer(Modifier.height(6.dp))
+                        SourceTraceRow(sourceLabel = msg.sourceLabel, elapsedMs = msg.elapsedMs)
+                    }
+                    if (msg.canGenerateWorkOrder && !msg.text.startsWith("正在")) {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = onGenerateWorkOrder,
+                            modifier = Modifier.fillMaxWidth().height(38.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, Accent.copy(alpha = 0.35f)),
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Assignment, null, Modifier.size(15.dp), tint = Accent)
+                            Spacer(Modifier.width(5.dp))
+                            Text("生成工单", fontSize = 13.sp, color = Accent)
+                        }
+                    }
                 }
 
                 // Related work orders from knowledge graph (for non-RAG responses)
@@ -2814,6 +4382,10 @@ private fun MessageBubble(msg: PocketMessage, onGenerateWorkOrder: () -> Unit = 
                     RelatedWorkOrdersSection(msg.relatedWorkOrders)
                 }
             }
+            if (!msg.isUser && msg.checklist != null) {
+                Spacer(Modifier.height(8.dp))
+                FieldChecklistCard(msg.checklist)
+            }
         }
     }
 }
@@ -2821,7 +4393,13 @@ private fun MessageBubble(msg: PocketMessage, onGenerateWorkOrder: () -> Unit = 
 // ==================== Diagnostic Card ====================
 
 @Composable
-private fun DiagnosticCard(r: DiagnosticReport, onGenerateWorkOrder: () -> Unit = {}, onShowGraph: () -> Unit = {}) {
+private fun DiagnosticCard(
+    r: DiagnosticReport,
+    onGenerateWorkOrder: () -> Unit = {},
+    onShowGraph: () -> Unit = {},
+    sourceLabel: String = "",
+    elapsedMs: Long = 0L,
+) {
     val severity = r.symptom.properties["severity"] ?: ""
     val (severityBg, severityFg) = severityColors(severity)
     Card(
@@ -2836,10 +4414,18 @@ private fun DiagnosticCard(r: DiagnosticReport, onGenerateWorkOrder: () -> Unit 
                 Column(Modifier.weight(1f)) {
                     Text("诊断报告", color = TextMain, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                     Spacer(Modifier.height(4.dp))
-                    Text("\u56fe\u8c31\u8bca\u65ad \u00b7 ${r.nodeCount} \u8282\u70b9", color = TextMuted, fontSize = 12.sp)
+                    Text(
+                        listOfNotNull(
+                            (sourceLabel.ifBlank { "\u56fe\u8c31\u8bca\u65ad" }),
+                            "${r.nodeCount} \u8282\u70b9",
+                            elapsedMs.takeIf { it > 0L }?.let { "${it}ms" },
+                        ).joinToString(" \u00b7 "),
+                        color = TextMuted,
+                        fontSize = 12.sp,
+                    )
                 }
                 Column(horizontalAlignment = Alignment.End) {
-                    StatusChip("\u56fe\u8c31\u8bca\u65ad", AccentSoft, Accent)
+                    StatusChip(sourceLabel.ifBlank { "\u56fe\u8c31\u8bca\u65ad" }, AccentSoft, Accent)
                     if (severity.isNotBlank()) {
                         Spacer(Modifier.height(8.dp))
                         StatusChip(severity, severityBg, severityFg)
@@ -2965,7 +4551,7 @@ private fun DiagnosticCard(r: DiagnosticReport, onGenerateWorkOrder: () -> Unit 
                             Text(wo.properties["date"] ?: "", fontSize = 11.sp, color = TextSubtle, modifier = Modifier.padding(top = 4.dp))
                             if (expanded) {
                                 Spacer(Modifier.height(8.dp))
-                                Divider(color = BorderSoft)
+                                HorizontalDivider(color = BorderSoft)
                                 Spacer(Modifier.height(8.dp))
                                 WorkOrderDetailRow("设备", wo.properties["equipment"] ?: "")
                                 WorkOrderDetailRow("故障", wo.properties["fault"] ?: "")
@@ -3008,7 +4594,14 @@ private fun DiagnosticCard(r: DiagnosticReport, onGenerateWorkOrder: () -> Unit 
 // ==================== LLM Diagnostic Card (non-RAG) ====================
 
 @Composable
-private fun LlmDiagnosticCard(text: String, onGenerateWorkOrder: () -> Unit) {
+private fun LlmDiagnosticCard(
+    text: String,
+    onGenerateWorkOrder: () -> Unit,
+    sourceLabel: String = "",
+    elapsedMs: Long = 0L,
+    onShowGraph: () -> Unit = {},
+    hasGraph: Boolean = false,
+) {
     val report = remember(text) { parseLlmReport(text) }
 
     Card(
@@ -3025,12 +4618,15 @@ private fun LlmDiagnosticCard(text: String, onGenerateWorkOrder: () -> Unit) {
                 Column(Modifier.weight(1f)) {
                     Text("诊断报告", color = TextMain, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                     Spacer(Modifier.height(4.dp))
-                    Text("\u7aef\u4fa7\u6a21\u578b\u8bca\u65ad", color = TextMuted, fontSize = 12.sp)
+                    SourceTraceRow(
+                        sourceLabel = sourceLabel.ifBlank { "\u7aef\u4fa7\u6a21\u578b\u8bca\u65ad" },
+                        elapsedMs = elapsedMs,
+                    )
                 }
                 report?.severity?.takeIf { it.isNotBlank() }?.let { severity ->
                     val (severityBg, severityFg) = severityColors(severity)
                     StatusChip(severity, severityBg, severityFg)
-                } ?: StatusChip("\u7aef\u4fa7\u6a21\u578b", AccentSoft, Accent)
+                } ?: StatusChip(sourceLabel.ifBlank { "\u7aef\u4fa7\u6a21\u578b" }, AccentSoft, Accent)
             }
             Spacer(Modifier.height(12.dp))
 
@@ -3042,6 +4638,23 @@ private fun LlmDiagnosticCard(text: String, onGenerateWorkOrder: () -> Unit) {
                         if (report.location.isNotBlank()) InfoRow("位置", report.location)
                         InfoRow("故障", report.symptom)
                         if (report.severity.isNotBlank()) InfoRow("严重度", report.severity)
+                    }
+                }
+
+                if (report.diagnosisBasis.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Label("端侧推理依据")
+                    report.diagnosisBasis.take(4).forEach { item ->
+                        Surface(color = SurfaceSoft, shape = RoundedCornerShape(14.dp)) {
+                            Text(
+                                item,
+                                fontSize = 13.sp,
+                                color = TextBody,
+                                lineHeight = 19.sp,
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
                     }
                 }
 
@@ -3132,6 +4745,39 @@ private fun LlmDiagnosticCard(text: String, onGenerateWorkOrder: () -> Unit) {
                         }
                     }
                 }
+
+                if (report.riskNote.isNotBlank() || report.temporaryAction.isNotBlank()) {
+                    Spacer(Modifier.height(12.dp))
+                    Label("风险与临时处置")
+                    Surface(color = WarningSoft, shape = RoundedCornerShape(14.dp), border = BorderStroke(1.dp, WarningColor.copy(alpha = 0.22f))) {
+                        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)) {
+                            if (report.riskNote.isNotBlank()) {
+                                Text("风险：${report.riskNote}", fontSize = 13.sp, color = TextBody, lineHeight = 19.sp)
+                            }
+                            if (report.temporaryAction.isNotBlank()) {
+                                if (report.riskNote.isNotBlank()) Spacer(Modifier.height(4.dp))
+                                Text("临时处置：${report.temporaryAction}", fontSize = 13.sp, color = TextBody, lineHeight = 19.sp)
+                            }
+                        }
+                    }
+                }
+
+                if (report.followUpQuestions.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Label("需要补充的信息")
+                    report.followUpQuestions.take(4).forEach { question ->
+                        Surface(color = SurfaceMuted, shape = RoundedCornerShape(14.dp)) {
+                            Text(
+                                question,
+                                fontSize = 13.sp,
+                                color = TextBody,
+                                lineHeight = 19.sp,
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
+                }
             } else {
                 // Fallback: render as Markdown
                 Surface(color = SurfaceMuted, shape = RoundedCornerShape(14.dp)) {
@@ -3140,12 +4786,121 @@ private fun LlmDiagnosticCard(text: String, onGenerateWorkOrder: () -> Unit) {
             }
 
             Spacer(Modifier.height(12.dp))
-            Button(
-                onClick = onGenerateWorkOrder,
-                Modifier.fillMaxWidth().height(42.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Accent),
-                shape = RoundedCornerShape(12.dp),
-            ) { Text("生成工单报告", fontSize = 14.sp) }
+            if (hasGraph) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = onGenerateWorkOrder,
+                        Modifier.weight(1f).height(42.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Accent),
+                        shape = RoundedCornerShape(12.dp),
+                    ) { Text("生成工单", fontSize = 14.sp) }
+                    OutlinedButton(
+                        onClick = onShowGraph,
+                        Modifier.weight(1f).height(42.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, BorderSoft),
+                    ) {
+                        Icon(Icons.Default.AccountTree, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("图谱依据", fontSize = 14.sp)
+                    }
+                }
+            } else {
+                Button(
+                    onClick = onGenerateWorkOrder,
+                    Modifier.fillMaxWidth().height(42.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Accent),
+                    shape = RoundedCornerShape(12.dp),
+                ) { Text("生成工单报告", fontSize = 14.sp) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SourceTraceRow(sourceLabel: String, elapsedMs: Long) {
+    val details = listOfNotNull(
+        sourceLabel.takeIf { it.isNotBlank() },
+        elapsedMs.takeIf { it > 0L }?.let { formatElapsedMs(it) },
+        "本机NPU",
+    ).joinToString(" · ")
+    Text(details, color = TextMuted, fontSize = 12.sp, lineHeight = 17.sp)
+}
+
+private fun formatElapsedMs(ms: Long): String {
+    return if (ms >= 1000L) {
+        String.format(Locale.US, "%.1fs", ms / 1000f)
+    } else {
+        "${ms}ms"
+    }
+}
+
+@Composable
+private fun FieldChecklistCard(checklist: FieldChecklist) {
+    val checked = remember(checklist.title, checklist.items) {
+        mutableStateListOf<Boolean>().apply { repeat(checklist.items.size) { add(false) } }
+    }
+    val completed = checked.count { it }
+    Card(
+        Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        border = BorderStroke(1.dp, BorderSoft),
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                Icon(Icons.Default.CheckCircle, null, tint = SuccessColor, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(checklist.title, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TextMain)
+                    Text(checklist.reason, fontSize = 12.sp, color = TextMuted, lineHeight = 18.sp)
+                }
+                StatusChip("$completed/${checklist.items.size}", SurfaceMuted, TextMuted)
+            }
+            Spacer(Modifier.height(10.dp))
+            LinearProgressIndicator(
+                progress = { if (checklist.items.isEmpty()) 0f else completed / checklist.items.size.toFloat() },
+                modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(999.dp)),
+                color = SuccessColor,
+                trackColor = SurfaceSoft,
+            )
+            Spacer(Modifier.height(10.dp))
+            checklist.items.forEachIndexed { index, item ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable { checked[index] = !checked[index] }
+                        .padding(vertical = 7.dp),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    Checkbox(
+                        checked = checked.getOrNull(index) == true,
+                        onCheckedChange = { checked[index] = it },
+                        modifier = Modifier.size(22.dp),
+                        colors = CheckboxDefaults.colors(checkedColor = SuccessColor),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            item.title,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = TextMain,
+                            lineHeight = 18.sp,
+                        )
+                        Text(item.detail, fontSize = 12.sp, color = TextMuted, lineHeight = 17.sp)
+                        if (checked.getOrNull(index) == true) {
+                            Spacer(Modifier.height(2.dp))
+                            Text(item.impact, fontSize = 12.sp, color = SuccessColor, lineHeight = 17.sp)
+                        }
+                    }
+                }
+                if (index != checklist.items.lastIndex) HorizontalDivider(color = BorderSoft)
+            }
+            if (checklist.items.isNotEmpty() && completed == checklist.items.size) {
+                Spacer(Modifier.height(8.dp))
+                Text("清单已完成，可把检查结果写入工单后再提交。", fontSize = 12.sp, color = SuccessColor)
+            }
         }
     }
 }
@@ -3205,7 +4960,7 @@ private fun RelatedWorkOrdersSection(workOrders: List<GraphNode>) {
                         }
                         if (expanded) {
                             Spacer(Modifier.height(6.dp))
-                            Divider(color = BorderSoft)
+                            HorizontalDivider(color = BorderSoft)
                             Spacer(Modifier.height(6.dp))
                             WorkOrderDetailRow("设备", wo.properties["equipment"] ?: "")
                             WorkOrderDetailRow("故障", wo.properties["fault"] ?: "")
@@ -3252,7 +5007,10 @@ private fun BluetoothDiagnosticDialog(onDismiss: () -> Unit, onConfirm: (Bluetoo
     val steps = listOf("搜索设备", "建立连接", "读取故障码", "读取参数")
 
     LaunchedEffect(Unit) {
-        for (i in 1..4) { kotlinx.coroutines.delay(1200); step = i }
+        for (i in 1..4) {
+            kotlinx.coroutines.delay(1200)
+            step = i
+        }
     }
 
     AlertDialog(
@@ -3435,6 +5193,7 @@ private fun WorkOrderDialog(
             personnel = personnel.map { it.trim() }.filter { it.isNotBlank() },
             relatedWorkOrders = relatedWorkOrders.map { it.trim() }.filter { it.isNotBlank() },
         )
+    val qualityReview = buildWorkOrderQualityReview(editedWorkOrder)
     val normalizedDemoServerBaseUrl = remember(demoServerBaseUrl) {
         normalizeDemoServerBaseUrl(demoServerBaseUrl)
     }
@@ -3541,6 +5300,9 @@ private fun WorkOrderDialog(
             )
             Spacer(Modifier.height(12.dp))
 
+            WorkOrderQualityCard(qualityReview)
+            Spacer(Modifier.height(12.dp))
+
             EditableTextBlockCard(title = "故障摘要", value = summary, onValueChange = { summary = it })
             EditableListCard(title = "可能原因", lines = causes, newItemLabel = "新增原因")
             EditableListCard(title = "维修步骤", lines = steps, newItemLabel = "新增步骤")
@@ -3609,7 +5371,17 @@ private fun WorkOrderDialog(
                     saveEditedRecordIfChanged()
                     onQueueWorkOrder(workOrderId, createdAt, editedWorkOrder)
                     onSubmitQueuedWorkOrders(true)
-                    Toast.makeText(context, "工单已进入待提交队列", Toast.LENGTH_SHORT).show()
+                    val qualityHint =
+                        qualityReview.missingItems.firstOrNull()
+                            ?.let { "，质量检查建议补充：$it" }
+                            .orEmpty()
+                    val submitHint =
+                        if (normalizedDemoServerBaseUrl.isNotBlank()) {
+                            "工单已保存，正在尝试提交；失败时会保留在待提交队列"
+                        } else {
+                            "工单已进入待提交队列"
+                        }
+                    Toast.makeText(context, "$submitHint$qualityHint", Toast.LENGTH_LONG).show()
                 },
                 modifier = Modifier.fillMaxWidth().height(44.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = SuccessColor),
@@ -3656,6 +5428,77 @@ private fun WoRow(label: String, value: String) {
             textAlign = TextAlign.End,
             modifier = Modifier.weight(1f),
         )
+    }
+}
+
+@Composable
+private fun WorkOrderQualityCard(review: WorkOrderQualityReview) {
+    val scoreColor = when {
+        review.score >= 85 -> SuccessColor
+        review.score >= 70 -> WarningColor
+        else -> DangerColor
+    }
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        shape = RoundedCornerShape(18.dp),
+        border = BorderStroke(1.dp, BorderSoft),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                Column(Modifier.weight(1f)) {
+                    Text("端侧工单质量检查", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = TextMain)
+                    Spacer(Modifier.height(3.dp))
+                    Text("提交前在本机检查关键信息是否缺失。", fontSize = 12.sp, color = TextMuted)
+                }
+                StatusChip(review.level, scoreColor.copy(alpha = 0.12f), scoreColor)
+            }
+            Spacer(Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                LinearProgressIndicator(
+                    progress = { review.score / 100f },
+                    modifier = Modifier.weight(1f).height(7.dp).clip(RoundedCornerShape(999.dp)),
+                    color = scoreColor,
+                    trackColor = SurfaceSoft,
+                )
+                Spacer(Modifier.width(10.dp))
+                Text("${review.score}%", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = scoreColor)
+            }
+            if (review.missingItems.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                Text("建议先补充", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DangerColor)
+                review.missingItems.forEach { item ->
+                    QualityLine(text = item, color = DangerColor)
+                }
+            }
+            if (review.suggestions.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text("可提升复盘价值", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = WarningColor)
+                review.suggestions.forEach { item ->
+                    QualityLine(text = item, color = WarningColor)
+                }
+            }
+            if (review.strengths.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    review.strengths.take(3).forEach { strength ->
+                        StatusChip(strength, SuccessSoft, SuccessColor)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QualityLine(text: String, color: Color) {
+    Row(Modifier.fillMaxWidth().padding(top = 5.dp), verticalAlignment = Alignment.Top) {
+        Box(Modifier.padding(top = 6.dp).size(5.dp).background(color, CircleShape))
+        Spacer(Modifier.width(8.dp))
+        Text(text, fontSize = 12.sp, color = TextBody, lineHeight = 17.sp, modifier = Modifier.weight(1f))
     }
 }
 
@@ -3968,14 +5811,18 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
             val nodesArr = obj.getJSONArray("nodes")
             val edgesArr = obj.getJSONArray("edges")
             val nodes = (0 until nodesArr.length()).map { i ->
-                val n = nodesArr.getJSONObject(i); GNode(n.getString("id"), n.getString("type"), n.getString("label"))
+                val n = nodesArr.getJSONObject(i)
+                GNode(n.getString("id"), n.getString("type"), n.getString("label"))
             }
             val edges = (0 until edgesArr.length()).map { i ->
                 val e = edgesArr.getJSONObject(i)
                 GEdge(e.getString("source"), e.getString("target"), e.getString("relation"), e.optJSONObject("properties")?.optString("probability") ?: "")
             }
             Triple(centerId, nodes, edges)
-        } catch (e: Exception) { Log.e(TAG, "GraphViz parse failed", e); null }
+        } catch (e: Exception) {
+            Log.e(TAG, "GraphViz parse failed", e)
+            null
+        }
     }
 
     val typeColors = mapOf(
@@ -4441,6 +6288,173 @@ private fun GraphVizSheet(graphJson: String, onDismiss: () -> Unit) {
     }
 }
 
+// ==================== Cloud Work Orders Sheet ====================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CloudWorkOrdersSheet(
+    records: List<DemoSubmittedWorkOrder>,
+    isLoading: Boolean,
+    error: String?,
+    onRefresh: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val maxSheetHeight = (LocalConfiguration.current.screenHeightDp * 0.86f).dp
+
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = BgColor) {
+        Column(Modifier.fillMaxWidth().heightIn(max = maxSheetHeight).padding(horizontal = 20.dp)) {
+            Row(
+                Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("云端工单", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = TextMain)
+                    Text("查看已提交到电脑服务的工单记录。", fontSize = 12.sp, color = TextMuted)
+                }
+                StatusChip("${records.size} 条", SurfaceMuted, TextMuted)
+            }
+
+            OutlinedButton(
+                onClick = onRefresh,
+                enabled = !isLoading,
+                modifier = Modifier.fillMaxWidth().height(42.dp),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, BorderSoft),
+            ) {
+                if (isLoading) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = Accent)
+                    Spacer(Modifier.width(8.dp))
+                    Text("正在刷新", fontSize = 13.sp)
+                } else {
+                    Icon(Icons.Default.Refresh, null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("刷新云端工单", fontSize = 13.sp)
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            when {
+                isLoading && records.isEmpty() -> {
+                    Box(Modifier.fillMaxWidth().height(220.dp), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(color = Accent)
+                    }
+                }
+                error != null -> {
+                    Surface(color = WarningSoft, shape = RoundedCornerShape(16.dp), border = BorderStroke(1.dp, WarningColor.copy(alpha = 0.24f))) {
+                        Text(
+                            error,
+                            color = WarningColor,
+                            fontSize = 13.sp,
+                            lineHeight = 20.sp,
+                            modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        )
+                    }
+                }
+                records.isEmpty() -> {
+                    Box(Modifier.fillMaxWidth().height(220.dp), contentAlignment = Alignment.Center) {
+                        Text("云端暂无已提交工单", fontSize = 14.sp, color = TextMuted)
+                    }
+                }
+                else -> {
+                    LazyColumn(Modifier.weight(1f)) {
+                        items(records) { record ->
+                            CloudWorkOrderCard(record)
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+        }
+    }
+}
+
+@Composable
+private fun CloudWorkOrderCard(record: DemoSubmittedWorkOrder) {
+    var expanded by remember(record.clientSubmissionId, record.workOrderId) { mutableStateOf(false) }
+    val workOrder = record.payload.workOrder
+    val title = record.workOrderId.ifBlank { record.serverWorkOrderId.ifBlank { record.clientSubmissionId.ifBlank { "云端工单" } } }
+    val submittedAt = record.submittedAt.take(19).replace('T', ' ')
+    val status = workOrder.status.ifBlank { "已提交" }
+
+    Card(
+        Modifier.fillMaxWidth().padding(vertical = 5.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, BorderSoft),
+        elevation = CardDefaults.cardElevation(1.dp),
+    ) {
+        Column(Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(title, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TextMain, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.height(3.dp))
+                    Text(submittedAt.ifBlank { "提交时间未知" }, fontSize = 11.sp, color = TextSubtle)
+                }
+                StatusChip(status, SuccessSoft, SuccessColor)
+                Spacer(Modifier.width(6.dp))
+                Icon(
+                    if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    null,
+                    tint = TextMuted,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+
+            Spacer(Modifier.height(10.dp))
+            Surface(color = SurfaceMuted, shape = RoundedCornerShape(14.dp)) {
+                Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                    InfoRow("设备", workOrder.equipment.ifBlank { "未填写" })
+                    if (workOrder.location.isNotBlank()) InfoRow("位置", workOrder.location)
+                    InfoRow("故障", workOrder.symptom.ifBlank { "未填写" })
+                    if (workOrder.severity.isNotBlank()) InfoRow("严重程度", workOrder.severity)
+                }
+            }
+
+            if (workOrder.summary.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text(workOrder.summary, fontSize = 12.sp, color = TextMuted, lineHeight = 18.sp, maxLines = if (expanded) Int.MAX_VALUE else 2)
+            }
+
+            if (expanded) {
+                CloudWorkOrderSection("可能原因", workOrder.causes)
+                CloudWorkOrderSection("维修步骤", workOrder.steps)
+                CloudWorkOrderSection("所需备件", workOrder.parts)
+                CloudWorkOrderSection("推荐人员", workOrder.personnel)
+                CloudWorkOrderSection("相似工单", workOrder.relatedWorkOrders)
+            } else {
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (workOrder.steps.isNotEmpty()) StatusChip("${workOrder.steps.size} 步骤", AccentSoft, Accent)
+                    if (workOrder.parts.isNotEmpty()) StatusChip("${workOrder.parts.size} 备件", SurfaceMuted, TextMuted)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CloudWorkOrderSection(title: String, lines: List<String>) {
+    if (lines.isEmpty()) return
+    Spacer(Modifier.height(10.dp))
+    Text(title, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = TextMain)
+    Spacer(Modifier.height(6.dp))
+    lines.forEach { line ->
+        Surface(color = SurfaceMuted, shape = RoundedCornerShape(12.dp)) {
+            Text(
+                line,
+                fontSize = 12.sp,
+                color = TextBody,
+                lineHeight = 18.sp,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+    }
+}
+
 // ==================== History Sheet ====================
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -4522,14 +6536,24 @@ private fun HistorySheet(history: List<HistoryEntry>, onDismiss: () -> Unit, onC
             }
             Spacer(Modifier.height(8.dp))
             if (history.isEmpty()) {
-                Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) { Text("暂无诊断记录", fontSize = 14.sp, color = TextMuted) }
+                Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) {
+                    Text("暂无诊断记录", fontSize = 14.sp, color = TextMuted)
+                }
             } else if (filteredHistory.isEmpty()) {
-                Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) { Text("没有匹配的历史记录", fontSize = 14.sp, color = TextMuted) }
+                Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) {
+                    Text("没有匹配的历史记录", fontSize = 14.sp, color = TextMuted)
+                }
             } else {
                 LazyColumn(Modifier.weight(1f)) {
                     items(filteredHistory.reversed()) { entry ->
                         Card(
-                            Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { onRestore(entry); onDismiss() },
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .clickable {
+                                    onRestore(entry)
+                                    onDismiss()
+                                },
                             colors = CardDefaults.cardColors(containerColor = Color.White),
                             elevation = CardDefaults.cardElevation(1.dp),
                             shape = RoundedCornerShape(14.dp),
@@ -4834,6 +6858,7 @@ private fun extractExplicitEquipmentMention(text: String): String? {
         listOf(
             Regex("""\d+\s*号\s*叉车"""),
             Regex("""叉车\s*\d+\s*号"""),
+            Regex("""AGV\s*搬运车""", RegexOption.IGNORE_CASE),
             Regex("""[A-Za-z0-9-]{2,}\s*(?:叉车|设备)"""),
         )
     return patterns
@@ -4904,6 +6929,327 @@ private fun buildUnknownEquipmentSymptomReport(
         )
     }
     return json.toString()
+}
+
+private fun buildDeepGraphReasoningContext(
+    userInput: String,
+    report: DiagnosticReport,
+    graphJson: String,
+    graphElapsedMs: Long,
+): String {
+    return buildString {
+        appendLine("用户原始问题：$userInput")
+        appendLine("本地知识图谱已命中，检索耗时：${graphElapsedMs}ms。")
+        appendLine("以下为强制采用的知识图谱事实，最终答案必须以这些事实为准：")
+        appendLine(buildGraphFactLockText(report))
+        appendLine()
+        appendLine("你只需要输出补充推理字段：diagnosisBasis、followUpQuestions、riskNote、temporaryAction。")
+        appendLine("不要输出设备、症状、原因、备件、步骤、人员、工单字段；这些字段由本地知识图谱确定性填充。")
+    }
+}
+
+private fun buildGraphGroundedProgressText(report: DiagnosticReport): String {
+    return buildString {
+        appendLine("已命中本地知识图谱，正在用端侧模型补充推理。")
+        appendLine()
+        appendLine(buildGraphFactLockText(report))
+    }.trim()
+}
+
+private fun buildGraphFactLockText(report: DiagnosticReport): String {
+    return buildString {
+        appendLine("设备：${report.equipment.label}")
+        report.equipment.properties["location"]?.takeIf { it.isNotBlank() }?.let { appendLine("位置：$it") }
+        appendLine("症状：${report.symptom.label}")
+        report.symptom.properties["severity"]?.takeIf { it.isNotBlank() }?.let { appendLine("严重度：$it") }
+        if (report.causes.isNotEmpty()) {
+            appendLine("图谱原因：${report.causes.joinToString("；") { cause -> "${cause.label} ${((cause.properties["probability"]?.toFloatOrNull() ?: 0f) * 100).toInt()}%" }}")
+        }
+        if (report.parts.isNotEmpty()) {
+            appendLine("图谱备件：${report.parts.joinToString("；") { part -> listOf(part.label, part.properties["spec"].orEmpty(), part.properties["stock"].orEmpty()).filter { it.isNotBlank() }.joinToString(" / ") }}")
+        }
+        if (report.steps.isNotEmpty()) {
+            appendLine("图谱步骤：${report.steps.joinToString(" -> ") { it.label }}")
+        }
+        if (report.workOrders.isNotEmpty()) {
+            appendLine("相似工单：${report.workOrders.joinToString("；") { workOrder -> "${workOrder.label} ${workOrder.properties["date"].orEmpty()} ${workOrder.properties["resolution"].orEmpty()}".trim() }}")
+        }
+    }.trim()
+}
+
+private fun mergeGraphFactsWithEdgeReasoning(
+    graphReport: DiagnosticReport,
+    reasoningText: String,
+    sourceLabel: String,
+): String {
+    val reasoning = parseLlmReport(reasoningText)
+    return buildGraphGroundedDiagnosisJson(
+        graphReport = graphReport,
+        diagnosisBasis = reasoning?.diagnosisBasis
+            ?.takeIf { it.isNotEmpty() }
+            ?: listOf(
+                "本地知识图谱命中设备“${graphReport.equipment.label}”和症状“${graphReport.symptom.label}”。",
+                "原因概率、备件、步骤和相似工单均来自本地知识图谱，端侧模型只补充排查解释。",
+            ),
+        followUpQuestions = reasoning?.followUpQuestions
+            ?.takeIf { it.isNotEmpty() }
+            ?: listOf("现场故障发生时是否伴随报警码或仪表异常？", "该症状是在空载还是负载状态下更明显？"),
+        riskNote = reasoning?.riskNote
+            ?.takeIf { it.isNotBlank() }
+            ?: "继续运行可能扩大故障范围，应按图谱步骤先完成安全检查。",
+        temporaryAction = reasoning?.temporaryAction
+            ?.takeIf { it.isNotBlank() }
+            ?: "降低负载或暂停使用，保留故障现场，先采集关键参数。",
+        sourceLabel = sourceLabel,
+    )
+}
+
+private fun buildGraphGroundedDiagnosisJson(
+    graphReport: DiagnosticReport,
+    diagnosisBasis: List<String>,
+    followUpQuestions: List<String>,
+    riskNote: String,
+    temporaryAction: String,
+    sourceLabel: String,
+): String {
+    return org.json.JSONObject().apply {
+        put("equipment", graphReport.equipment.label)
+        put("location", graphReport.equipment.properties["location"].orEmpty())
+        put("symptom", graphReport.symptom.label)
+        put("severity", graphReport.symptom.properties["severity"].orEmpty())
+        put(
+            "causes",
+            org.json.JSONArray().apply {
+                graphReport.causes.forEach { cause ->
+                    put(
+                        org.json.JSONObject()
+                            .put("name", cause.label)
+                            .put("probability", ((cause.properties["probability"]?.toFloatOrNull() ?: 0f) * 100).toInt()),
+                    )
+                }
+            },
+        )
+        put(
+            "parts",
+            org.json.JSONArray().apply {
+                graphReport.parts.forEach { part ->
+                    put(
+                        org.json.JSONObject()
+                            .put("name", part.label)
+                            .put("spec", part.properties["spec"].orEmpty())
+                            .put("stock", part.properties["stock"].orEmpty()),
+                    )
+                }
+            },
+        )
+        put(
+            "steps",
+            org.json.JSONArray().apply {
+                graphReport.steps.forEach { step ->
+                    put(
+                        org.json.JSONObject()
+                            .put("title", step.label)
+                            .put("duration", step.properties["duration"].orEmpty())
+                            .put("tool", step.properties["tool"].orEmpty()),
+                    )
+                }
+            },
+        )
+        put(
+            "personnel",
+            org.json.JSONArray().apply {
+                graphReport.personnel.forEach { person ->
+                    put(
+                        org.json.JSONObject()
+                            .put("name", person.label)
+                            .put("skill", person.properties["skill"].orEmpty())
+                            .put("experience", person.properties["experience"].orEmpty()),
+                    )
+                }
+            },
+        )
+        put(
+            "workOrders",
+            org.json.JSONArray().apply {
+                graphReport.workOrders.forEach { workOrder ->
+                    put(
+                        org.json.JSONObject()
+                            .put("id", workOrder.label)
+                            .put("date", workOrder.properties["date"].orEmpty())
+                            .put("resolution", workOrder.properties["resolution"].orEmpty()),
+                    )
+                }
+            },
+        )
+        put(
+            "diagnosisBasis",
+            org.json.JSONArray().apply {
+                put("$sourceLabel：诊断主体来自本地知识图谱。")
+                diagnosisBasis.take(4).forEach { put(it) }
+            },
+        )
+        put("followUpQuestions", org.json.JSONArray().apply { followUpQuestions.take(4).forEach { put(it) } })
+        put("riskNote", riskNote)
+        put("temporaryAction", temporaryAction)
+    }.toString()
+}
+
+private fun buildUnknownSymptomReasoningContext(
+    userInput: String,
+    explicitEquipmentMention: String?,
+    graph: MaintenanceKnowledgeGraph,
+): String {
+    val equipment = graph.findEquipment(userInput).firstOrNull()
+    val equipmentLabel =
+        equipment?.label
+            ?: explicitEquipmentMention?.let { "$it（知识库未收录）" }
+            ?: "待确认设备"
+    val similarSymptoms = findSimilarSymptomsForUnknownInput(userInput, graph)
+    return buildString {
+        appendLine("用户原始问题：$userInput")
+        appendLine("设备识别：$equipmentLabel")
+        appendLine("知识库未直接命中该症状，请进入端侧泛化诊断。")
+        appendLine("约束：不能输出确定故障码；不能把相似症状当作已命中结论；必须说明需要采集哪些数据来验证。")
+        if (similarSymptoms.isNotEmpty()) {
+            appendLine()
+            appendLine("可参考的相似症状，不代表直接命中：")
+            similarSymptoms.forEach { symptom ->
+                val sub = graph.traverseFromNode(symptom.id, maxHops = 2)
+                val causes = sub.nodes
+                    .filter { it.type == NodeType.ROOT_CAUSE }
+                    .sortedByDescending { it.properties["probability"]?.toFloatOrNull() ?: 0f }
+                    .take(3)
+                    .joinToString("、") { it.label }
+                val steps = sub.nodes
+                    .filter { it.type == NodeType.REPAIR_STEP }
+                    .sortedBy { it.properties["order"]?.toIntOrNull() ?: 99 }
+                    .take(3)
+                    .joinToString("、") { it.label }
+                appendLine("- ${symptom.label}：严重度${symptom.properties["severity"].orEmpty()}；常见原因：${causes.ifBlank { "暂无" }}；参考排查：${steps.ifBlank { "暂无" }}")
+            }
+        } else {
+            appendLine("未找到足够相似的症状参考。请主要输出通用安全排查路径。")
+        }
+    }
+}
+
+private fun buildLocalFallbackDiagnosisJson(
+    userInput: String,
+    sourceLabel: String,
+    equipmentMention: String?,
+    graphReport: DiagnosticReport?,
+    unknownSymptom: Boolean,
+): String {
+    val equipment =
+        graphReport?.equipment?.label
+            ?: equipmentMention?.let { "$it（知识库未收录）" }
+            ?: "待确认设备"
+    val location = graphReport?.equipment?.properties?.get("location").orEmpty()
+    val symptom = graphReport?.symptom?.label ?: userInput.take(40).ifBlank { "待确认症状" }
+    val severity = graphReport?.symptom?.properties?.get("severity").orEmpty().ifBlank { "中" }
+    return org.json.JSONObject().apply {
+        put("equipment", equipment)
+        put("location", location)
+        put("symptom", symptom)
+        put("severity", severity)
+        put(
+            "causes",
+            org.json.JSONArray().apply {
+                val graphCauses = graphReport?.causes.orEmpty().take(3)
+                if (graphCauses.isNotEmpty()) {
+                    graphCauses.forEach { cause ->
+                        put(
+                            org.json.JSONObject()
+                                .put("name", cause.label)
+                                .put("probability", ((cause.properties["probability"]?.toFloatOrNull() ?: 0f) * 100).toInt()),
+                        )
+                    }
+                } else {
+                    put(org.json.JSONObject().put("name", "现场数据不足，需先采集电压、压力、温度或故障码").put("probability", 45))
+                    put(org.json.JSONObject().put("name", "部件老化、接插件松动或传感器异常").put("probability", 35))
+                }
+            },
+        )
+        put(
+            "parts",
+            org.json.JSONArray().apply {
+                graphReport?.parts.orEmpty().take(3).forEach { part ->
+                    put(
+                        org.json.JSONObject()
+                            .put("name", part.label)
+                            .put("spec", part.properties["spec"].orEmpty())
+                            .put("stock", part.properties["stock"].orEmpty()),
+                    )
+                }
+            },
+        )
+        put(
+            "steps",
+            org.json.JSONArray().apply {
+                val graphSteps = graphReport?.steps.orEmpty().take(4)
+                if (graphSteps.isNotEmpty()) {
+                    graphSteps.forEach { step ->
+                        put(
+                            org.json.JSONObject()
+                                .put("title", step.label)
+                                .put("duration", step.properties["duration"].orEmpty())
+                                .put("tool", step.properties["tool"].orEmpty()),
+                        )
+                    }
+                } else {
+                    put(org.json.JSONObject().put("title", "记录故障出现工况、仪表提示和异常声音/气味").put("duration", "3分钟").put("tool", "现场询问"))
+                    put(org.json.JSONObject().put("title", "采集电池电压、液压压力、温度和控制器故障码").put("duration", "8分钟").put("tool", "万用表/诊断仪"))
+                    put(org.json.JSONObject().put("title", "按系统分支隔离电气、液压、机械传动异常").put("duration", "15分钟").put("tool", "点检表"))
+                }
+            },
+        )
+        put("personnel", org.json.JSONArray())
+        put("workOrders", org.json.JSONArray())
+        put(
+            "diagnosisBasis",
+            org.json.JSONArray().apply {
+                put(if (unknownSymptom) "知识库未直接命中该症状，当前为端侧泛化诊断。" else "$sourceLabel，端侧模型输出为空时启用本地兜底结构。")
+                graphReport?.let { put("已参考图谱中的${it.symptom.label}、${it.causes.size}个原因和${it.steps.size}个步骤。") }
+            },
+        )
+        put(
+            "followUpQuestions",
+            org.json.JSONArray().apply {
+                put("故障是在启动、行走、举升还是制动时出现？")
+                put("仪表盘或控制器是否有故障码、报警灯或异常参数？")
+                put("最近是否更换过电池、液压油、传感器或维修过相关部件？")
+            },
+        )
+        put("riskNote", if (unknownSymptom) "症状未被知识库确认，继续运行可能扩大故障范围，应先完成基础安全检查。" else "需结合现场参数确认优先原因，避免只按历史概率更换备件。")
+        put("temporaryAction", "降载运行或暂停使用，保留现场状态，先完成电气、液压和故障码采集。")
+    }.toString()
+}
+
+private fun CharSequence.countCharsMatching(predicate: (Char) -> Boolean): Int {
+    var count = 0
+    for (char in this) {
+        if (predicate(char)) count += 1
+    }
+    return count
+}
+
+private fun findSimilarSymptomsForUnknownInput(userInput: String, graph: MaintenanceKnowledgeGraph): List<GraphNode> {
+    val allSymptoms = graph.findEquipment("叉车")
+        .flatMap { equipment -> SYMPTOM_KEYWORDS.flatMap { keyword -> graph.findSymptoms(equipment.id, keyword) } }
+        .distinctBy { it.id }
+    if (allSymptoms.isEmpty()) return emptyList()
+    val normalizedInput = userInput.filterNot { it.isWhitespace() }
+    return allSymptoms
+        .map { symptom ->
+            val score =
+                symptom.label.countCharsMatching { char -> normalizedInput.contains(char) } +
+                    symptom.properties.values.sumOf { value -> value.countCharsMatching { char -> normalizedInput.contains(char) } }.coerceAtMost(3)
+            symptom to score
+        }
+        .sortedWith(compareByDescending<Pair<GraphNode, Int>> { it.second }.thenBy { it.first.label.length })
+        .filter { it.second > 0 }
+        .map { it.first }
+        .take(4)
 }
 
 private fun buildGraphRAGReport(

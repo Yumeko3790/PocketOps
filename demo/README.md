@@ -10,10 +10,12 @@
 - 返回 `GET /api/pocketops/bootstrap/manifest`
 - 返回 `POST /api/pocketops/materials/query`
 - 返回 `POST /api/pocketops/work-orders/submit`
+- 返回 `GET /api/pocketops/work-orders/submitted`
 - 通过 `/files/...` 提供静态资源下载
 - 支持 `GET`、`HEAD` 和 `Range`，可用于验证断点续传
 - 优先读取真实仓库里的 `knowledge_graph.json`
 - 为 demo 现场生成示例 PDF、ZIP、JSON 文件
+- 将 Android 端提交的工单持久化到 `demo/submitted_work_orders.json`
 
 ## 目录文件
 
@@ -63,6 +65,13 @@ python demo/mock_pocketops_server.py \
 python demo/mock_pocketops_server.py \
   --demo-username engineer \
   --demo-password PocketOps@2026
+```
+
+覆盖已提交工单保存路径：
+
+```bash
+python demo/mock_pocketops_server.py \
+  --submitted-work-orders demo/submitted_work_orders.json
 ```
 
 ## 自动搜索 knowledge graph 的逻辑
@@ -148,6 +157,21 @@ Authorization: Bearer <accessToken>
 
 Android 端会先把工单保存到本机待提交队列，再尝试提交。电脑服务不可用时不会丢单；服务恢复后会自动补交。
 
+提交成功后，mock server 会写入：
+
+```text
+demo/submitted_work_orders.json
+```
+
+### 6. 已提交工单查询
+
+```http
+GET /api/pocketops/work-orders/submitted
+Authorization: Bearer <accessToken>
+```
+
+返回 `count` 和按提交时间倒序排列的 `records`。
+
 ## 返回的示例文件
 
 当前 mock server 会提供这些下载资源：
@@ -200,6 +224,13 @@ curl http://127.0.0.1:8080/files/core/knowledge_graph.json \
   -o partial.json
 ```
 
+### 5. 查询已提交工单
+
+```bash
+curl http://127.0.0.1:8080/api/pocketops/work-orders/submitted \
+  -H "Authorization: Bearer $TOKEN"
+```
+
 ## 手机接入方式
 
 ### 方式一：同一 Wi-Fi
@@ -237,7 +268,7 @@ http://127.0.0.1:8080
 ## 当前实现限制
 
 - 只有演示账号密码和内存 token，没有生产级用户、租户、审计和 token 刷新
-- 没有数据库
+- 没有数据库；已提交工单以 JSON 文件方式保存在 `demo/submitted_work_orders.json`
 - 没有对象存储/CDN
 - `summary` 里的统计大部分是演示值
 - `materials` 结果主要用于验证链路，不代表真实业务召回逻辑

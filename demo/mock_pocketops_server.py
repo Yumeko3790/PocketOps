@@ -6,6 +6,7 @@ Serves:
 - GET  /api/pocketops/bootstrap/manifest
 - POST /api/pocketops/materials/query
 - POST /api/pocketops/work-orders/submit
+- GET  /api/pocketops/work-orders/submitted
 - GET/HEAD /files/...
 
 The server reads the real bundled knowledge graph from the Android assets
@@ -41,6 +42,7 @@ DEFAULT_MIN_SUPPORTED_APP_VERSION = "4.8"
 DEFAULT_DEMO_USERNAME = "engineer"
 DEFAULT_DEMO_PASSWORD = "PocketOps@2026"
 DEFAULT_TOKEN_TTL_SECONDS = 8 * 60 * 60
+DEFAULT_SUBMITTED_WORK_ORDERS_PATH = ROOT / "demo" / "submitted_work_orders.json"
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ ASSETS: Dict[str, FileAsset] = {}
 GRAPH_STATS: Dict[str, object] = {}
 AUTH_SESSIONS: Dict[str, Dict[str, object]] = {}
 SUBMITTED_WORK_ORDERS: Dict[str, Dict[str, object]] = {}
+SUBMITTED_WORK_ORDERS_PATH = DEFAULT_SUBMITTED_WORK_ORDERS_PATH
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -75,7 +78,10 @@ def build_pdf_bytes(title: str, subtitle: str) -> bytes:
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 180] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 180] "
+            b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>"
+        ),
         b"<< /Length %d >>\nstream\n%s\nendstream" % (len(stream), stream),
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
@@ -206,7 +212,11 @@ def build_assets(knowledge_graph_path: Path) -> Dict[str, FileAsset]:
     work_orders_bytes = build_work_orders_payload()
     sop_zip_bytes = build_zip_bytes(
         {
-            "sop/inspection_checklist.txt": "1. Confirm pressure level.\n2. Inspect hose leakage.\n3. Verify lift response.\n",
+            "sop/inspection_checklist.txt": (
+                "1. Confirm pressure level.\n"
+                "2. Inspect hose leakage.\n"
+                "3. Verify lift response.\n"
+            ),
             "sop/parts_list.txt": "Hydraulic seal kit\nPressure relief valve\nFilter element\n",
         }
     )
@@ -217,7 +227,9 @@ def build_assets(knowledge_graph_path: Path) -> Dict[str, FileAsset]:
     history_zip = build_zip_bytes(
         {
             "history/work_order_1024.txt": "WO-1024: replaced seal kit and flushed oil line.",
-            "history/work_order_2048.txt": "WO-2048: steering pressure restored after valve replacement.",
+            "history/work_order_2048.txt": (
+                "WO-2048: steering pressure restored after valve replacement."
+            ),
             "photos/README.txt": "Placeholder attachment bundle for the PocketOps demo.",
         }
     )
@@ -232,7 +244,12 @@ def build_assets(knowledge_graph_path: Path) -> Dict[str, FileAsset]:
     ).encode("utf-8")
 
     def asset(path: str, content: bytes, mime_type: str) -> FileAsset:
-        return FileAsset(path=path, content=content, mime_type=mime_type, sha256=sha256_bytes(content))
+        return FileAsset(
+            path=path,
+            content=content,
+            mime_type=mime_type,
+            sha256=sha256_bytes(content),
+        )
 
     return {
         "/files/core/knowledge_graph.json": asset(
@@ -287,7 +304,12 @@ def build_manifest(
     return {
         "syncVersion": sync_version,
         "minSupportedAppVersion": min_supported_app_version,
-        "generatedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "generatedAt": (
+            datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        ),
         "summary": {
             "equipmentCount": 32,
             "faultCaseCount": 286,
@@ -299,9 +321,21 @@ def build_manifest(
             "personnelCount": 48,
         },
         "displaySteps": [
-            {"key": "equipment", "title": "Sync equipment records", "detail": "32 devices across 6 workshops"},
-            {"key": "work_orders", "title": "Sync work order history", "detail": "2156 records in last 3 years"},
-            {"key": "knowledge_graph", "title": "Sync diagnosis knowledge graph", "detail": f"{node_count} nodes / {edge_count} edges"},
+            {
+                "key": "equipment",
+                "title": "Sync equipment records",
+                "detail": "32 devices across 6 workshops",
+            },
+            {
+                "key": "work_orders",
+                "title": "Sync work order history",
+                "detail": "2156 records in last 3 years",
+            },
+            {
+                "key": "knowledge_graph",
+                "title": "Sync diagnosis knowledge graph",
+                "detail": f"{node_count} nodes / {edge_count} edges",
+            },
         ],
         "resources": [
             {
@@ -423,6 +457,61 @@ def build_materials(base_url: str, payload: Dict[str, object]) -> Dict[str, obje
     }
 
 
+def load_submitted_work_orders(path: Path) -> Dict[str, Dict[str, object]]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Warning: failed to read submitted work orders from {path}: {exc}")
+        return {}
+
+    records = payload.get("records") if isinstance(payload, dict) else payload
+    if not isinstance(records, list):
+        return {}
+
+    result: Dict[str, Dict[str, object]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        client_submission_id = str(record.get("clientSubmissionId") or "")
+        if client_submission_id:
+            result[client_submission_id] = record
+    return result
+
+
+def save_submitted_work_orders(path: Path, records: Dict[str, Dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ordered_records = sorted(
+        records.values(),
+        key=lambda record: str(record.get("submittedAt") or ""),
+        reverse=True,
+    )
+    payload = {
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "count": len(ordered_records),
+        "records": ordered_records,
+    }
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+    temp_path.replace(path)
+
+
+def submitted_work_orders_response() -> Dict[str, object]:
+    records = sorted(
+        SUBMITTED_WORK_ORDERS.values(),
+        key=lambda record: str(record.get("submittedAt") or ""),
+        reverse=True,
+    )
+    return {
+        "count": len(records),
+        "records": records,
+    }
+
+
 def store_submitted_work_order(payload: Dict[str, object]) -> Dict[str, object]:
     work_order_id = str(payload.get("workOrderId") or "")
     client_submission_id = str(payload.get("clientSubmissionId") or "")
@@ -434,10 +523,13 @@ def store_submitted_work_order(payload: Dict[str, object]) -> Dict[str, object]:
     server_id = f"server-{work_order_id}"
     submitted_at = datetime.now(timezone.utc).isoformat()
     SUBMITTED_WORK_ORDERS[client_submission_id] = {
+        "clientSubmissionId": client_submission_id,
+        "workOrderId": work_order_id,
         "serverWorkOrderId": server_id,
         "submittedAt": submitted_at,
         "payload": payload,
     }
+    save_submitted_work_orders(SUBMITTED_WORK_ORDERS_PATH, SUBMITTED_WORK_ORDERS)
     return {
         "accepted": True,
         "serverWorkOrderId": server_id,
@@ -453,7 +545,10 @@ def authenticate_demo_user(
     expected_username: str,
     expected_password: str,
 ) -> bool:
-    return hmac.compare_digest(username, expected_username) and hmac.compare_digest(password, expected_password)
+    return hmac.compare_digest(username, expected_username) and hmac.compare_digest(
+        password,
+        expected_password,
+    )
 
 
 def create_auth_session(username: str) -> Dict[str, object]:
@@ -583,6 +678,12 @@ class PocketOpsDemoHandler(BaseHTTPRequestHandler):
 
     def handle_request(self, with_body: bool) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/pocketops/work-orders/submitted":
+            if not self.require_auth(with_body=with_body):
+                return
+            self.send_json(submitted_work_orders_response(), with_body=with_body)
+            return
+
         if parsed.path == "/api/pocketops/bootstrap/manifest":
             if not self.require_auth(with_body=with_body):
                 return
@@ -613,19 +714,31 @@ class PocketOpsDemoHandler(BaseHTTPRequestHandler):
     def require_auth(self, with_body: bool = True) -> bool:
         header = self.headers.get("Authorization", "")
         if not header.startswith("Bearer "):
-            self.send_json({"error": "missing_bearer_token"}, status=HTTPStatus.UNAUTHORIZED, with_body=with_body)
+            self.send_json(
+                {"error": "missing_bearer_token"},
+                status=HTTPStatus.UNAUTHORIZED,
+                with_body=with_body,
+            )
             return False
 
         token = header.removeprefix("Bearer ").strip()
         session = AUTH_SESSIONS.get(token)
         if session is None:
-            self.send_json({"error": "invalid_bearer_token"}, status=HTTPStatus.UNAUTHORIZED, with_body=with_body)
+            self.send_json(
+                {"error": "invalid_bearer_token"},
+                status=HTTPStatus.UNAUTHORIZED,
+                with_body=with_body,
+            )
             return False
 
         expires_at = session.get("expiresAt")
         if not isinstance(expires_at, datetime) or expires_at <= datetime.now(timezone.utc):
             AUTH_SESSIONS.pop(token, None)
-            self.send_json({"error": "expired_bearer_token"}, status=HTTPStatus.UNAUTHORIZED, with_body=with_body)
+            self.send_json(
+                {"error": "expired_bearer_token"},
+                status=HTTPStatus.UNAUTHORIZED,
+                with_body=with_body,
+            )
             return False
 
         return True
@@ -684,7 +797,10 @@ class PocketOpsDemoHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
 
     def log_message(self, fmt: str, *args: object) -> None:
-        sys.stdout.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
+        sys.stdout.write(
+            "%s - - [%s] %s\n"
+            % (self.address_string(), self.log_date_time_string(), fmt % args)
+        )
 
 
 def iter_candidate_urls(host: str, port: int) -> Iterable[str]:
@@ -729,10 +845,23 @@ def main() -> None:
         default=DEFAULT_DEMO_PASSWORD,
         help="Demo login password.",
     )
+    parser.add_argument(
+        "--submitted-work-orders",
+        type=Path,
+        default=DEFAULT_SUBMITTED_WORK_ORDERS_PATH,
+        help=(
+            "Path for persisted submitted work orders, "
+            f"default: {DEFAULT_SUBMITTED_WORK_ORDERS_PATH}"
+        ),
+    )
     args = parser.parse_args()
 
     knowledge_graph_path = resolve_knowledge_graph_path(args.knowledge_graph)
     bootstrap_assets(knowledge_graph_path)
+    global SUBMITTED_WORK_ORDERS_PATH
+    SUBMITTED_WORK_ORDERS_PATH = args.submitted_work_orders
+    SUBMITTED_WORK_ORDERS.clear()
+    SUBMITTED_WORK_ORDERS.update(load_submitted_work_orders(SUBMITTED_WORK_ORDERS_PATH))
 
     server = ThreadingHTTPServer((args.host, args.port), PocketOpsDemoHandler)
     server.sync_version = args.sync_version
@@ -745,6 +874,8 @@ def main() -> None:
     print(f"Manifest minSupportedAppVersion: {args.min_supported_app_version}")
     print(f"Demo login username: {args.demo_username}")
     print(f"Demo login password: {args.demo_password}")
+    print(f"Submitted work orders file: {SUBMITTED_WORK_ORDERS_PATH}")
+    print(f"Loaded submitted work orders: {len(SUBMITTED_WORK_ORDERS)}")
     print("Use one of these URLs in the Android demo:")
     for url in dict.fromkeys(iter_candidate_urls(args.host, args.port)):
         print(f"  {url}")
