@@ -277,5 +277,5 @@ http://127.0.0.1:8080
 
 如果你修改了 `mock_pocketops_server.py` 的返回字段，请同步更新：
 
-- `../POCKETOPS_SERVER_INTEGRATION_SPEC.md`
+- `../docs/project/POCKETOPS_SERVER_INTEGRATION_SPEC.md`
 - 本文档

@@ -9,5 +9,9 @@ Android/src/.gradle/
 Android/src/android-user-home/
 *.apk
 
+# Demo/runtime outputs
+demo/submitted_work_orders.json
+artifacts/**/chrome_profile/
+
 # Native libs (too large for git)
 Android/src/app/src/main/jniLibs/

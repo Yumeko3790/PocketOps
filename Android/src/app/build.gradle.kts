@@ -77,6 +77,7 @@ dependencies {
     implementation(libs.material.icon.extended)
     implementation(libs.com.google.code.gson)
     implementation(libs.androidx.security.crypto)
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

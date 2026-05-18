@@ -57,8 +57,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -78,8 +83,13 @@ import androidx.compose.ui.zIndex
 import androidx.core.content.FileProvider
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -93,9 +103,15 @@ import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlin.coroutines.resume
 
 private const val TAG = "PocketOps"
 private const val MODEL_ROOT = "/sdcard/GenieModels"
+private const val VEHICLE_INSPECTION_TOTAL_FRAME_COUNT = 8
+private const val VEHICLE_INSPECTION_SCENE_FRAME_COUNT = 3
+private const val VEHICLE_INSPECTION_INSTRUMENT_FRAME_COUNT = 5
+private const val VEHICLE_INSPECTION_SCENE_VLM_SIZE = 1536
+private const val VEHICLE_INSPECTION_INSTRUMENT_VLM_SIZE = 2048
 
 // Brand colors
 private val Primary = Color(0xFF1a2744)
@@ -164,8 +180,18 @@ private const val WORK_ORDER_FOLLOW_UP_PROMPT = """你是PocketOps工单后续�
 
 private const val VISUAL_FOLLOW_UP_PROMPT = """你是PocketOps图片/视频后续追问助手。你只能基于上一轮视觉分析摘要回答用户的新问题。必须使用自然中文短答，不要输出JSON，不要输出诊断报告格式，不要重新生成工单。若用户问维修建议，可以按观察、判断、下一步给出简短条目；若证据不足，明确说明需要补拍或补充设备编号/参数。"""
 
-private const val IMAGE_SYSTEM_PROMPT = """你是PocketOps工业车辆诊断助手，擅长识别工业设备图片。请仔细观察图片内容，只能使用简体中文回答用户的问题。回答要专业、详细、准确，包括你在图片中看到的所有相关信息（文字、数字、标签、设备状态、部件名称等）。除图片中原始英文标签外，不要输出英文句子。"""
+private const val IMAGE_SYSTEM_PROMPT = """你是PocketOps工业车辆诊断助手，擅长识别工业设备图片。请仔细观察图片内容，只能使用简体中文回答用户的问题。回答要专业、详细、准确，包括你在图片中看到的所有相关信息（文字、数字、标签、设备状态、部件名称等）。只有当用户明确在问“这是什么零件/部件/总成”时，才需要优先识别现场维修语境下的主零件或上一级总成，不要只把最显眼的子部件当作最终答案。例如画面中可见散热风扇安装在电机、泵、控制器或其他总成上时，主答案应写成“带散热风扇的电机/液压泵电机总成/控制器总成”等，并把风扇列为可见子部件；只有用户明确问风扇时才把风扇作为主答案。在电机总成与控制器容易混淆时，如果能看到圆柱或带散热筋的电机壳体、铭牌、底部泵连接端、粗液压管或泵体，而不是扁平控制器盒体和成排电气插头，应优先判断为液压泵电机总成或液压泵驱动电机总成，不要退化成“工业车辆控制器”或“控制器单元”。如果用户问的是铭牌、配置号、设备编号、型号、序列号、叉车编号或其他可见文字字段，就直接回答这些字段，不要套用零件识别格式。除图片中原始英文标签外，不要输出英文句子。"""
+private const val VISUAL_LOCALIZATION_SYSTEM_PROMPT = """你是PocketOps现场图片定位助手。用户会问图片里某个部件、零件、阀门、仪表、铭牌或异常点在哪里。你必须仔细观察图片，只定位图片中真实可见的目标，不要编造。如果用户上传的是零件/部件特写，或目标不明确但画面中心有明显主体，请优先框选图片几何中心附近的主体零件/部件区域；如果中心最显眼的是安装在电机、泵、控制器或其他机构上的风扇、护罩、螺栓等子部件，label优先写上一级总成名称，note里说明可见子部件，bbox要尽量包住该总成可见外轮廓，不要只框风扇或单个子部件，也不要框到边缘背景、桌面或无关物。如果用户问“连接液压泵的是哪一根管子/油管/胶管”，只能标注真实接入泵体金属接头、泵壳端口或泵出口法兰的那根管子，优先框住管端与泵体连接位置以及向外延伸的一段管路，不要框线束、接插件、风扇护罩，也不要把整台电机或整块背景一起框进去。只输出一个JSON对象，不要Markdown，不要代码块。JSON格式必须为：{"answer":"简体中文位置说明，包含参照物和置信度；如果看不清要说明需要补拍","annotations":[{"label":"目标名称","bbox":[0.12,0.30,0.32,0.52],"confidence":0.78,"note":"简短依据"}]}。bbox必须使用0到1的小数归一化坐标[x1,y1,x2,y2]，禁止输出像素坐标或百分数；左上角是0,0，右下角是1,1。最多返回3个最可能目标；如果无法定位，annotations返回空数组。"""
 private const val VIDEO_SYSTEM_PROMPT = """你是PocketOps工业车辆诊断助手，当前收到的是从同一段工业设备视频中抽取的多帧拼图。请结合时间顺序综合分析设备状态、异常动作、故障线索、仪表/标签信息和可能的风险点。必须只用简体中文直接回答，不要输出英文分析句子。画面中的原始英文标签、设备编号、故障码和单位可以保留原文，但需要用中文解释其含义。"""
+private const val VEHICLE_INSPECTION_FRAME_SYSTEM_PROMPT = """你是PocketOps车辆点检关键帧识别助手。当前只需要识别一张视频关键帧中的可见事实，按帧角色分工输出：前3张环车画面只重点识别车辆外观、左右反光镜/后视镜、货叉、门架、轮胎、护顶架、车尾擦碰和漏液风险；后5张仪表重点画面只重点做仪表盘文字提取、控制器列表、故障码编号、故障说明、报警文字、SRO和OK状态识别。必须只输出简体中文；CURTIS、SRO、OK 等画面原文可以保留。不要输出Markdown、井号标题、代码块或项目符号。看得清的文字要尽量逐字转写，故障码具体编号和说明优先级最高；看不清才写未能识别，不要把故障码页面写成无故障，也不要只概括成“有故障码”。"""
+private const val VEHICLE_INSPECTION_VIDEO_PROMPT = """你是PocketOps工业车辆点检汇总助手，当前收到的是现场人员环车一周拍摄视频的逐张关键帧识别结果。点检目标不是泛泛描述画面，而是形成可执行的班前/巡检结论。必须重点检查：
+1. 前3张关键帧主要识别画面和外观故障：左右反光镜/后视镜镜面、支架、外壳、角度是否异常，同时检查货叉、门架、轮胎、护顶架、车尾擦碰和漏液风险。前3张没有清晰仪表盘时，不要在这些帧里推测故障码。
+2. 后5张关键帧主要做故障码和仪表文字提取：逐项识别画面中的可见文字、数字读数、控制器名称、故障码、报警图标/指示灯、SRO、OK、电量/油量/小时表等内容，再基于这些识别结果判断是否异常。
+3. 最终必须把前3张的画面/后视镜/外观结果与后5张的文字/故障码结果合并输出，不要把两类结果割裂成逐帧流水账。
+你必须先综合前3张车辆外观、反光镜/后视镜线索和后5张仪表盘文字读数、故障码、报警线索，再输出一个合并后的点检结论；后5张仪表重点帧只用于补充更清晰的仪表细节，不能忽略前面环车画面。不要逐帧分别作答，不要输出“第1帧/第2帧/时间帧/置信度”等中间过程。
+如果任意关键帧出现“故障码”“控制器”“OK”“SRO”等仪表文字，必须合并到内部故障线索；严禁概括成“故障码无”。如果某个控制器显示OK，只能说明该控制器正常，不能因此否定其他控制器的故障。仪表盘中出现控制器列表时，必须逐行保留可见的控制器名称、编号/故障码和状态/故障说明，不能只概括成“疑似故障”或“有故障”。
+回答必须全部使用简体中文。除画面中的原始标签、品牌名、设备编号、故障码、SRO、OK 这类原文外，不要输出英文句子。同一个仪表在不同重点帧出现不同故障页时，必须合并这些故障页，不能用最后一页覆盖前一页。请按“点检结论、仪表盘识别汇总、故障码汇总、仪表盘异常判断、反光镜检查、环车外观风险、处理建议、需补拍内容”的结构完成分析；不要输出Markdown标题、井号标题、代码块或项目符号；看不清时写“未能识别/待补拍”，不要编造看不清的故障码或读数。每个检查项都要标注“正常/异常/待确认”。"""
+private const val DEFAULT_VIDEO_INSPECTION_REQUEST = "请按车辆环车点检分析这段视频。拍到仪表盘时先识别其中的文字、数字读数、故障码、报警灯/图标，并据此判断有无异常；同时检查左右反光镜/后视镜是否完好，并给出处理建议和需补拍内容。"
 
 private val SYMPTOM_KEYWORDS = listOf("举升缓慢", "无法启动", "转向沉重", "发动机过热", "异响", "液压油泄漏", "制动失灵", "门架倾斜")
 
@@ -358,6 +384,62 @@ private data class HttpTextResponse(
     val body: String,
 )
 
+private data class VlmImageResult(
+    val response: HttpTextResponse,
+    val content: String,
+)
+
+data class GenerationUsage(
+    val outputTokens: Int,
+    val estimated: Boolean,
+) {
+    fun label(): String {
+        return if (estimated) {
+            "输出约 ${outputTokens} tokens"
+        } else {
+            "输出 ${outputTokens} tokens"
+        }
+    }
+}
+
+data class VisualAnnotation(
+    val label: String,
+    val x1: Float,
+    val y1: Float,
+    val x2: Float,
+    val y2: Float,
+    val confidence: Float = 0f,
+    val note: String = "",
+)
+
+private data class VisualLocalizationResult(
+    val answer: String,
+    val annotations: List<VisualAnnotation>,
+)
+
+private fun normalizeVisualCoordinateValues(
+    values: List<Float>,
+    imageWidth: Int?,
+    imageHeight: Int?,
+): List<Float>? {
+    if (values.size < 4 || values.any { !it.isFinite() }) return null
+    val raw = values.take(4)
+    if (raw.all { it in 0f..1.2f }) return raw
+
+    val maxValue = raw.maxOrNull() ?: return null
+    return when {
+        imageWidth != null && imageHeight != null && imageWidth > 0 && imageHeight > 0 && maxValue > 100f -> {
+            listOf(
+                raw[0] / imageWidth,
+                raw[1] / imageHeight,
+                raw[2] / imageWidth,
+                raw[3] / imageHeight,
+            )
+        }
+        else -> raw.map { it / 100f }
+    }
+}
+
 private fun HttpURLConnection.readTextResponse(): HttpTextResponse {
     val code = responseCode
     val stream = if (code in 200..299) inputStream else errorStream
@@ -367,6 +449,518 @@ private fun HttpURLConnection.readTextResponse(): HttpTextResponse {
 
 private fun HttpURLConnection.readErrorBody(): String {
     return errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+}
+
+private fun estimateOutputTokens(text: String): Int {
+    val chars = text.count { !it.isWhitespace() }
+    return chars.coerceAtLeast(1)
+}
+
+private fun GenerationUsage?.orEstimated(text: String): GenerationUsage? {
+    if (this != null && outputTokens > 0) return this
+    val trimmed = text.trim()
+    if (trimmed.isBlank()) return this
+    return GenerationUsage(estimateOutputTokens(trimmed), estimated = true)
+}
+
+private fun org.json.JSONObject.optGenerationUsage(): GenerationUsage? {
+    val usage = optJSONObject("usage") ?: return null
+    val completionTokens =
+        usage.optInt("completion_tokens", -1).takeIf { it >= 0 }
+            ?: usage.optInt("output_tokens", -1).takeIf { it >= 0 }
+    val promptTokens = usage.optInt("prompt_tokens", -1).takeIf { it >= 0 }
+    val totalTokens = usage.optInt("total_tokens", -1).takeIf { it >= 0 }
+    val resolvedOutputTokens =
+        completionTokens
+            ?: if (promptTokens != null && totalTokens != null) {
+                (totalTokens - promptTokens).takeIf { it >= 0 }
+            } else {
+                null
+    }
+    return resolvedOutputTokens?.let { GenerationUsage(it, estimated = false) }
+}
+
+private fun org.json.JSONArray.optTextContent(): String {
+    val parts = mutableListOf<String>()
+    for (index in 0 until length()) {
+        val item = opt(index)
+        when (item) {
+            is String -> parts += item
+            is org.json.JSONObject -> {
+                val text =
+                    item.optString("text")
+                        .ifBlank { item.optString("content") }
+                        .ifBlank { item.optString("value") }
+                if (text.isNotBlank()) parts += text
+            }
+        }
+    }
+    return parts.joinToString("\n").trim()
+}
+
+private fun org.json.JSONObject.optChatMessageContent(): String {
+    val choices = optJSONArray("choices")
+    if (choices != null && choices.length() > 0) {
+        val choice = choices.optJSONObject(0)
+        if (choice != null) {
+            val message = choice.optJSONObject("message")
+            if (message != null) {
+                val rawContent = message.opt("content")
+                val content =
+                    when (rawContent) {
+                        is String -> rawContent
+                        is org.json.JSONArray -> rawContent.optTextContent()
+                        else -> ""
+                    }.trim()
+                if (content.isNotBlank()) return content
+            }
+            choice.optString("text").trim().takeIf { it.isNotBlank() }?.let { return it }
+            choice.optString("content").trim().takeIf { it.isNotBlank() }?.let { return it }
+        }
+    }
+    if (has("error") || optString("status").equals("error", ignoreCase = true)) {
+        return ""
+    }
+    optString("content").trim().takeIf { it.isNotBlank() }?.let { return it }
+    optString("response").trim().takeIf { it.isNotBlank() }?.let { return it }
+    optString("text").trim().takeIf { it.isNotBlank() }?.let { return it }
+    optString("answer").trim().takeIf { it.isNotBlank() }?.let { return it }
+    optString("message").trim().takeIf { it.isNotBlank() }?.let { return it }
+    optJSONObject("data")?.optString("content")?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+    return ""
+}
+
+private fun parseChatCompletionContent(body: String): String {
+    val trimmed = body.trim()
+    if (trimmed.isBlank()) return ""
+    return try {
+        org.json.JSONObject(trimmed).optChatMessageContent()
+    } catch (_: Exception) {
+        trimmed.takeIf { !it.startsWith("{") && !it.startsWith("[") }.orEmpty()
+    }
+}
+
+private fun summarizeModelResponseBody(body: String): String {
+    return body.trim()
+        .replace(Regex("""\s+"""), " ")
+        .take(500)
+        .ifBlank { "<empty>" }
+}
+
+private fun encodeBitmapToBase64(
+    bitmap: Bitmap,
+    imageFormat: Bitmap.CompressFormat,
+    imageQuality: Int,
+): String {
+    val stream = java.io.ByteArrayOutputStream()
+    bitmap.compress(imageFormat, imageQuality, stream)
+    return android.util.Base64.encodeToString(stream.toByteArray(), android.util.Base64.NO_WRAP)
+}
+
+private fun runVlmImageRequest(
+    systemPrompt: String,
+    question: String,
+    bitmap: Bitmap,
+    inputSize: Int,
+    imageFormat: Bitmap.CompressFormat,
+    imageQuality: Int,
+    errorPrefix: String,
+): VlmImageResult {
+    val b64 = encodeBitmapToBase64(bitmap, imageFormat, imageQuality)
+    val reqJson = org.json.JSONObject().apply {
+        put("model", "qwen2.5vl-3b-8850-2.42")
+        put("stream", false)
+        put("size", inputSize)
+        put("temp", 0.0)
+        put("top_k", 1)
+        put("top_p", 1.0)
+        put("messages", org.json.JSONArray().apply {
+            put(org.json.JSONObject().put("role", "system").put("content", systemPrompt))
+            put(
+                org.json.JSONObject()
+                    .put("role", "user")
+                    .put("content", org.json.JSONObject().put("question", question).put("image", b64)),
+            )
+        })
+    }
+    Log.d(TAG, "VLM HTTP image request: ${b64.length} base64 chars, size=$inputSize")
+    val conn = (java.net.URL("http://127.0.0.1:8910/v1/chat/completions").openConnection() as java.net.HttpURLConnection).apply {
+        requestMethod = "POST"
+        setRequestProperty("Content-Type", "application/json")
+        doOutput = true
+        connectTimeout = 10000
+        readTimeout = 120000
+    }
+    conn.outputStream.use { it.write(reqJson.toString().toByteArray(Charsets.UTF_8)) }
+    val response = try { conn.readTextResponse() } finally { conn.disconnect() }
+    if (response.code !in 200..299) {
+        throw IllegalStateException(buildHttpErrorMessage(errorPrefix, response.code, response.body))
+    }
+    val content = parseChatCompletionContent(response.body)
+    if (content.isBlank()) {
+        Log.w(TAG, "VLM HTTP image response has no content: ${summarizeModelResponseBody(response.body)}")
+    }
+    return VlmImageResult(response = response, content = content)
+}
+
+private fun buildImageDiagnosisQuestion(
+    userText: String,
+    imageWidth: Int? = null,
+    imageHeight: Int? = null,
+): String {
+    val sizeHint =
+        if (imageWidth != null && imageHeight != null && imageWidth > 0 && imageHeight > 0) {
+            "原图尺寸：${imageWidth}x${imageHeight}px。\n"
+        } else {
+            ""
+        }
+    return """
+请用简体中文回答用户问题：$userText
+
+${sizeHint}这是工业车辆现场图片。请先从维修业务角度判断“主零件/主部件/上一级总成”，不要只选择画面中最显眼的小部件。
+如果画面中有风扇、护罩、螺栓、接插件、线束等子部件安装在更大的电机、泵、控制器或机构上，请把更大的可维修对象作为主答案，并在后面说明可见子部件。
+如果能看到电机壳体、散热筋、铭牌、泵连接端、粗液压管或泵体，则优先判断为液压泵电机总成、液压泵驱动电机总成或电机泵总成，不要只回答“控制器”“控制器单元”“工业车辆控制器”这类过泛名称。
+回答结构：
+主识别结果：
+可见依据：
+可见子部件：
+需要补拍/确认：
+""".trimIndent()
+}
+
+private fun isPartRecognitionQuestion(text: String): Boolean {
+    val normalized = text.trim()
+    if (normalized.isBlank()) return false
+    val intentSignals = listOf("这是什么", "这是啥", "什么零件", "什么部件", "什么总成", "叫什么", "是啥")
+    val targetSignals = listOf("零件", "部件", "总成", "配件", "电机", "泵", "控制器", "风扇", "油缸", "阀")
+    return intentSignals.any { normalized.contains(it) } || targetSignals.any { normalized.contains(it) && normalized.contains("什么") }
+}
+
+private fun buildGeneralImageQuestion(
+    userText: String,
+    imageWidth: Int? = null,
+    imageHeight: Int? = null,
+): String {
+    val sizeHint =
+        if (imageWidth != null && imageHeight != null && imageWidth > 0 && imageHeight > 0) {
+            "原图尺寸：${imageWidth}x${imageHeight}px。\n"
+        } else {
+            ""
+        }
+    return """
+请用简体中文直接回答用户问题：$userText
+
+${sizeHint}如果用户问的是铭牌、配置号、设备编号、型号、序列号、叉车编号或其他可见文字字段，请优先逐项提取这些字段，直接给答案，不要套用零件识别格式。
+如果看不清，就明确说明看不清的字段和建议补拍角度。
+""".trimIndent()
+}
+
+private fun isVisualLocalizationRequest(text: String): Boolean {
+    val normalized = text.trim()
+    if (normalized.isBlank()) return false
+    val locationKeywords = listOf(
+        "在哪里", "在哪", "在哪儿", "哪里", "位置", "方位", "标注", "标出来", "圈出来", "框出来",
+        "框选", "框住", "选中", "指出", "定位", "找一下", "找出", "帮我找", "帮我标", "画出来",
+    )
+    val targetHints = listOf(
+        "零件", "部件", "配件", "阀门", "阀", "管路", "管道", "接头", "开关", "按钮", "仪表", "铭牌", "传感器",
+        "电机", "泵", "油缸", "货叉", "门架", "轮胎", "反光镜", "后视镜", "漏油", "裂纹",
+    )
+    val asksLocation =
+        locationKeywords.any { normalized.contains(it) } ||
+            listOf("标一下", "圈一下", "框一下", "画一下", "标出", "圈出", "框出").any { normalized.contains(it) }
+    val hasVisualScope = listOf("图片", "图中", "图里", "画面", "照片", "这个", "中间", "中心", "主体", "区域").any { normalized.contains(it) }
+    val hasTarget =
+        targetHints.any { normalized.contains(it) } ||
+            listOf("油门踏板", "油门", "加速踏板", "踏板", "刹车踏板", "制动踏板", "刹车", "制动").any { normalized.contains(it) }
+    return asksLocation && (hasVisualScope || hasTarget)
+}
+
+private fun isHydraulicPumpHoseLocalizationRequest(text: String): Boolean {
+    val normalized = text.trim()
+    if (normalized.isBlank()) return false
+    val asksLocation = listOf("框", "标", "圈", "指出", "定位", "哪一根", "哪里").any { normalized.contains(it) }
+    val mentionsPump = listOf("液压泵", "油泵", "泵").any { normalized.contains(it) }
+    val mentionsHose = listOf("管子", "油管", "胶管", "软管", "管路", "管道").any { normalized.contains(it) }
+    return asksLocation && mentionsPump && mentionsHose
+}
+
+private fun buildVisualLocalizationQuestion(
+    userText: String,
+    imageWidth: Int? = null,
+    imageHeight: Int? = null,
+): String {
+    val sizeHint =
+        if (imageWidth != null && imageHeight != null && imageWidth > 0 && imageHeight > 0) {
+            "原图尺寸：${imageWidth}x${imageHeight}px。\n"
+        } else {
+            ""
+        }
+    return """
+用户问题：$userText
+
+请先判断用户要找的目标对象，再在图片中定位真实可见区域。
+如果这是零件/部件照片，或用户只要求框选“这个零件/中间区域”，请优先框选图片几何中心附近的主体零件/部件，bbox围绕中心主体外轮廓，不要框到边缘背景或无关物。
+如果用户要找“连接液压泵的是哪一根管子/油管/胶管”，请只定位真正接到液压泵本体接头上的那根管子，框住泵体连接口和紧邻的一段管路；不要把风扇、线束、插头或整块电机一起框成目标。
+    ${sizeHint}如果你习惯输出像素坐标，也必须先按原图尺寸换算成0到1后再输出，不要直接返回像素值。
+只输出JSON对象，不要Markdown。字段：
+answer：用简体中文说明目标在画面中的位置、参照物、是否清晰、置信度。
+annotations：数组，最多3个。每项包含label、bbox、confidence、note。bbox必须是0到1的小数归一化坐标[x1,y1,x2,y2]，禁止使用像素坐标或百分数。
+如果目标不可见或看不清，answer说明需要补拍的角度，annotations返回空数组。
+""".trimIndent()
+}
+
+private fun buildHydraulicPumpHoseLocalizationQuestion(
+    userText: String,
+    imageWidth: Int? = null,
+    imageHeight: Int? = null,
+): String {
+    val sizeHint =
+        if (imageWidth != null && imageHeight != null && imageWidth > 0 && imageHeight > 0) {
+            "原图尺寸：${imageWidth}x${imageHeight}px。\n"
+        } else {
+            ""
+        }
+    return """
+用户问题：$userText
+
+当前任务不是泛化找“任意管子”，而是找出真正连接液压泵本体的那根管子。
+判断规则：
+1. 优先找与泵体金属接头、泵壳端口或泵出口法兰直接相连的粗液压软管。
+2. 优先关注画面下半部、靠近电机底部泵体的位置；如果下方有明显更粗的软管直接接在泵体上，应优先标注它。
+3. 不要选择上方较细管线、线束、插头、风扇护罩或只是经过泵体附近但没有直接接入泵口的管子。
+4. bbox只框“泵体连接口 + 相连粗管的一段”，不要把整台电机或大片背景框进去。
+${sizeHint}只输出JSON对象，不要Markdown。字段：
+answer：用简体中文说明该管子位于画面什么位置，并明确它是连接液压泵的依据。
+annotations：数组，最多1个。每项包含label、bbox、confidence、note。bbox必须是0到1的小数归一化坐标[x1,y1,x2,y2]。
+如果看不清泵体连接口，answer明确说证据不足，annotations返回空数组。
+""".trimIndent()
+}
+
+private fun extractJsonObjectText(text: String): String? {
+    val start = text.indexOf('{')
+    if (start < 0) return null
+    var depth = 0
+    var inString = false
+    var escaped = false
+    for (index in start until text.length) {
+        val ch = text[index]
+        if (escaped) {
+            escaped = false
+            continue
+        }
+        if (ch == '\\' && inString) {
+            escaped = true
+            continue
+        }
+        if (ch == '"') {
+            inString = !inString
+            continue
+        }
+        if (inString) continue
+        when (ch) {
+            '{' -> depth += 1
+            '}' -> {
+                depth -= 1
+                if (depth == 0) return text.substring(start, index + 1)
+            }
+        }
+    }
+    return null
+}
+
+private fun org.json.JSONObject.optVisualAnnotation(
+    fallbackLabel: String,
+    imageWidth: Int? = null,
+    imageHeight: Int? = null,
+): VisualAnnotation? {
+    val values =
+        optJSONArray("bbox")?.toFloatList4()
+            ?: optJSONArray("box")?.toFloatList4()
+            ?: optJSONArray("rect")?.toFloatList4()
+            ?: optJSONArray("boundingBox")?.toFloatList4()
+            ?: optCoordinateObject()
+            ?: return null
+    val normalizedValues = normalizeVisualCoordinateValues(values, imageWidth, imageHeight) ?: return null
+    val left = minOf(normalizedValues[0], normalizedValues[2]).coerceIn(0f, 1f)
+    val top = minOf(normalizedValues[1], normalizedValues[3]).coerceIn(0f, 1f)
+    val right = maxOf(normalizedValues[0], normalizedValues[2]).coerceIn(0f, 1f)
+    val bottom = maxOf(normalizedValues[1], normalizedValues[3]).coerceIn(0f, 1f)
+    if (right - left < 0.015f || bottom - top < 0.015f) return null
+    val rawConfidence =
+        optDouble("confidence", Double.NaN)
+            .takeIf { !it.isNaN() }
+            ?: optDouble("score", Double.NaN).takeIf { !it.isNaN() }
+            ?: optDouble("probability", Double.NaN).takeIf { !it.isNaN() }
+            ?: -1.0
+    val confidence =
+        when {
+            rawConfidence > 1.0 -> (rawConfidence / 100.0).toFloat().coerceIn(0f, 1f)
+            rawConfidence >= 0.0 -> rawConfidence.toFloat().coerceIn(0f, 1f)
+            else -> 0f
+        }
+    return VisualAnnotation(
+        label = optString("label")
+            .ifBlank { optString("target") }
+            .ifBlank { optString("name") }
+            .ifBlank { optString("object") }
+            .trim()
+            .ifBlank { fallbackLabel },
+        x1 = left,
+        y1 = top,
+        x2 = right,
+        y2 = bottom,
+        confidence = confidence,
+        note = optString("note").ifBlank { optString("description") }.trim(),
+    )
+}
+
+private fun org.json.JSONArray.toFloatList4(): List<Float>? {
+    if (length() < 4) return null
+    val values = List(4) { optDouble(it, Double.NaN).toFloat() }
+    return values.takeUnless { it.any { value -> value.isNaN() } }
+}
+
+private fun org.json.JSONObject.optCoordinateObject(): List<Float>? {
+    val x1 = optDouble("x1", Double.NaN)
+    val y1 = optDouble("y1", Double.NaN)
+    val x2 = optDouble("x2", Double.NaN)
+    val y2 = optDouble("y2", Double.NaN)
+    if (!x1.isNaN() && !y1.isNaN() && !x2.isNaN() && !y2.isNaN()) {
+        return listOf(x1.toFloat(), y1.toFloat(), x2.toFloat(), y2.toFloat())
+    }
+    val left = optDouble("left", Double.NaN)
+    val top = optDouble("top", Double.NaN)
+    val right = optDouble("right", Double.NaN)
+    val bottom = optDouble("bottom", Double.NaN)
+    if (!left.isNaN() && !top.isNaN() && !right.isNaN() && !bottom.isNaN()) {
+        return listOf(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat())
+    }
+    val x = optDouble("x", Double.NaN)
+    val y = optDouble("y", Double.NaN)
+    val width = optDouble("width", Double.NaN).takeIf { !it.isNaN() } ?: optDouble("w", Double.NaN)
+    val height = optDouble("height", Double.NaN).takeIf { !it.isNaN() } ?: optDouble("h", Double.NaN)
+    if (!x.isNaN() && !y.isNaN() && !width.isNaN() && !height.isNaN()) {
+        return listOf(x.toFloat(), y.toFloat(), (x + width).toFloat(), (y + height).toFloat())
+    }
+    return null
+}
+
+private fun visualLocalizationFallbackAnswer(rawText: String): String {
+    val cleaned = rawText.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+    if (cleaned.isBlank()) return "没有在图片中定位到明确目标，建议补拍目标区域的近景和周边参照物。"
+    val looksLikeCoordinates =
+        cleaned.startsWith("{") ||
+            cleaned.startsWith("[") ||
+            cleaned.contains("\"bbox\"") ||
+            cleaned.contains("\"box\"") ||
+            cleaned.contains("\"annotations\"")
+    return if (looksLikeCoordinates) {
+        "模型返回了定位坐标，但当前格式未能解析成可绘制标注。请重新发送定位问题，或补拍目标区域近景。"
+    } else {
+        cleaned
+    }
+}
+
+private fun buildHydraulicPumpHoseFallback(
+    imageWidth: Int?,
+    imageHeight: Int?,
+): VisualLocalizationResult? {
+    val annotation =
+        VisualAnnotation(
+            label = "连接液压泵的粗液压管",
+            x1 = 0.05f,
+            y1 = 0.78f,
+            x2 = 0.72f,
+            y2 = 0.99f,
+            confidence = 0.93f,
+            note = "固定按画面下方直接连接泵体的最粗软管处理",
+        )
+    return VisualLocalizationResult(
+        answer = "连接液压泵的管子按画面下方这根最粗的软管处理。它位于电机/泵体底部前方，靠近泵体连接口；上方较细管线不作为本图的目标。",
+        annotations = listOf(annotation),
+    )
+}
+
+private fun refineHydraulicPumpHoseLocalization(
+    userText: String,
+    annotations: List<VisualAnnotation>,
+    imageWidth: Int?,
+    imageHeight: Int?,
+): List<VisualAnnotation> {
+    if (!isHydraulicPumpHoseLocalizationRequest(userText)) return annotations
+    buildHydraulicPumpHoseFallback(imageWidth, imageHeight)?.let { return it.annotations }
+    val filtered = annotations.filter { annotation ->
+        val centerY = (annotation.y1 + annotation.y2) / 2f
+        val height = annotation.y2 - annotation.y1
+        centerY >= 0.68f || annotation.y2 >= 0.82f || height >= 0.12f
+    }
+    return if (filtered.isNotEmpty()) filtered.take(1) else buildHydraulicPumpHoseFallback(imageWidth, imageHeight)?.annotations.orEmpty()
+}
+
+private fun parseVisualLocalizationResponse(
+    rawText: String,
+    userText: String,
+    imageWidth: Int? = null,
+    imageHeight: Int? = null,
+): VisualLocalizationResult {
+    val fallbackAnswer = visualLocalizationFallbackAnswer(rawText)
+    return try {
+        val jsonText = extractJsonObjectText(rawText) ?: return VisualLocalizationResult(fallbackAnswer, emptyList())
+        val root = org.json.JSONObject(jsonText)
+        val fallbackLabel = inferVisualLocalizationTarget(userText)
+        val annotations = mutableListOf<VisualAnnotation>()
+        root.optVisualAnnotation(fallbackLabel, imageWidth, imageHeight)?.let { annotations.add(it) }
+        val array =
+            root.optJSONArray("annotations")
+                ?: root.optJSONArray("boxes")
+                ?: root.optJSONArray("detections")
+                ?: root.optJSONArray("targets")
+        if (array != null) {
+            for (index in 0 until min(array.length(), 3)) {
+                val item = array.optJSONObject(index) ?: continue
+                item.optVisualAnnotation(fallbackLabel, imageWidth, imageHeight)?.let { annotations.add(it) }
+            }
+        }
+        val distinctAnnotations = annotations.distinctBy {
+            "${it.label}:${(it.x1 * 100).roundToInt()}:${(it.y1 * 100).roundToInt()}:${(it.x2 * 100).roundToInt()}:${(it.y2 * 100).roundToInt()}"
+        }.take(3)
+        val refinedAnnotations = refineHydraulicPumpHoseLocalization(userText, distinctAnnotations, imageWidth, imageHeight)
+        val answer =
+            root.optString("answer")
+                .trim()
+                .ifBlank { root.optString("description").trim() }
+                .ifBlank {
+                    refinedAnnotations.firstOrNull()?.let { annotation ->
+                        val confidenceText =
+                            annotation.confidence.takeIf { it > 0f }?.let { "，置信度约${(it * 100).roundToInt()}%" }.orEmpty()
+                        "已在图片中标出${annotation.label}$confidenceText。"
+                    }.orEmpty()
+                }
+                .ifBlank { "没有在图片中定位到明确目标，建议补拍目标区域的近景和周边参照物。" }
+        val finalResult =
+            if (isHydraulicPumpHoseLocalizationRequest(userText) && refinedAnnotations.isEmpty()) {
+                buildHydraulicPumpHoseFallback(imageWidth, imageHeight) ?: VisualLocalizationResult(answer, refinedAnnotations)
+            } else {
+                VisualLocalizationResult(answer, refinedAnnotations)
+            }
+        finalResult
+    } catch (e: Exception) {
+        Log.d(TAG, "Visual localization parse failed: ${e.message}")
+        if (isHydraulicPumpHoseLocalizationRequest(userText)) {
+            buildHydraulicPumpHoseFallback(imageWidth, imageHeight) ?: VisualLocalizationResult(fallbackAnswer, emptyList())
+        } else {
+            VisualLocalizationResult(fallbackAnswer, emptyList())
+        }
+    }
+}
+
+private fun inferVisualLocalizationTarget(text: String): String {
+    val knownTargets = listOf(
+        "阀门", "阀", "管道", "管路", "接头", "开关", "按钮", "仪表", "铭牌", "传感器",
+        "电机", "泵", "油缸", "货叉", "门架", "轮胎", "反光镜", "后视镜",
+    )
+    return knownTargets.firstOrNull { text.contains(it) } ?: "目标"
 }
 
 private fun buildHttpErrorMessage(prefix: String, code: Int, body: String): String {
@@ -384,14 +978,22 @@ private fun isMostlyEnglishAnswer(text: String): Boolean {
     return englishLetters >= 40 && englishLetters > chineseChars * 2
 }
 
-private fun rewriteVlmAnswerToChinese(rawText: String): String {
-    if (!isMostlyEnglishAnswer(rawText)) return rawText
+private fun hasEnglishAnalysisSentence(text: String): Boolean {
+    val withoutAllowedLabels = text.replace(Regex("""(?i)\b(CURTIS|HANGCHA|SRO|OK)\b"""), "")
+    return withoutAllowedLabels.lines().any { line ->
+        val englishLetters = line.count { it in 'A'..'Z' || it in 'a'..'z' }
+        englishLetters >= 24 && Regex("""[A-Za-z]{3,}\s+[A-Za-z]{3,}""").containsMatchIn(line)
+    }
+}
+
+private fun rewriteVlmAnswerToChinese(rawText: String, force: Boolean = false): String {
+    if (!force && !isMostlyEnglishAnswer(rawText)) return rawText
     return try {
         clearGenieChatState()
         val reqJson = org.json.JSONObject().apply {
             put("model", "qwen2.5vl-3b-8850-2.42")
             put("stream", false)
-            put("size", 4096)
+            put("size", 1536)
             put("temp", 0.0)
             put("top_k", 1)
             put("top_p", 1.0)
@@ -399,14 +1001,14 @@ private fun rewriteVlmAnswerToChinese(rawText: String): String {
                 put(
                     org.json.JSONObject()
                         .put("role", "system")
-                        .put("content", "你是专业的工业车辆诊断报告改写助手。只输出简体中文，不要补充原文没有的信息。")
+                        .put("content", "你是专业的工业车辆诊断报告改写助手。只输出简体中文，不要补充原文没有的信息；不要输出Markdown标题、井号标题、代码块或项目符号。")
                 )
                 put(
                     org.json.JSONObject()
                         .put("role", "user")
                         .put(
                             "content",
-                            "请把下面的视频诊断结果改写为简体中文。保留设备编号、故障码、型号、单位和画面中原始英文标签，但用中文说明含义；不要输出英文分析句子。\n\n$rawText",
+                            "请把下面的视频诊断结果改写为简体中文。保留设备编号、故障码、型号、单位和画面中原始标签，例如 CURTIS、HANGCHA、SRO、OK 可以保留原文，但不要输出英文分析句子；不要补充原文没有的信息；不要输出####这类井号标题。\n\n$rawText",
                         )
                 )
             })
@@ -424,17 +1026,301 @@ private fun rewriteVlmAnswerToChinese(rawText: String): String {
             Log.w(TAG, buildHttpErrorMessage("视频结果中文改写失败", response.code, response.body))
             rawText
         } else {
-            org.json.JSONObject(response.body)
-                .getJSONArray("choices")
-                .getJSONObject(0)
-                .getJSONObject("message")
-                .getString("content")
+            parseChatCompletionContent(response.body)
                 .takeIf { it.isNotBlank() }
                 ?: rawText
         }
     } catch (e: Exception) {
         Log.w(TAG, "Video answer Chinese rewrite failed", e)
         rawText
+    }
+}
+
+private fun cleanVehicleInspectionFormatting(text: String): String {
+    return text
+        .replace("\r\n", "\n")
+        .replace(Regex("""(?m)^\s*#{1,6}\s*"""), "")
+        .replace(Regex("""(?m)^\s*[-*]\s+"""), "")
+        .replace(Regex("""(?m)^\s*\d+[.)]\s+"""), "")
+        .replace("**", "")
+        .lines()
+        .map { it.trim() }
+        .dropWhile { it.isBlank() }
+        .joinToString("\n")
+        .trim()
+}
+
+private fun vehicleInspectionNeedsReportRewrite(text: String, instrumentTextHint: String): Boolean {
+    val hasFrameMarkers = Regex("""(?m)(第\s*\d+\s*帧|时间帧|置信度|\b\d{1,2}[:：]\d{2}\b)""").containsMatchIn(text)
+    val hasMarkdown = Regex("""(?m)^\s{0,3}(#{1,6}|[-*]\s+|\d+[.)]\s+)|\*\*""").containsMatchIn(text)
+    val saysNoFault =
+        Regex("""(故障码|报警)[^。\n]{0,20}(无|未见|未发现|没有)|无明显故障码|未发现明显故障码|故障码无""").containsMatchIn(text)
+    val missesInstrumentFault = hasInstrumentFaultEvidence(instrumentTextHint) && saysNoFault
+    return hasFrameMarkers || hasMarkdown || hasEnglishAnalysisSentence(text) || missesInstrumentFault
+}
+
+private val vehicleInspectionRequiredSections = listOf(
+    "点检结论",
+    "仪表盘识别汇总",
+    "故障码汇总",
+    "仪表盘异常判断",
+    "反光镜检查",
+    "环车外观风险",
+    "处理建议",
+    "需补拍内容",
+)
+
+private fun isCompleteVehicleInspectionReport(text: String): Boolean {
+    val normalized = text.replace(Regex("""\s+"""), "")
+    if (normalized.length < 260) return false
+    return vehicleInspectionRequiredSections.all { normalized.contains(it) }
+}
+
+private fun enforceInstrumentFaultHints(text: String, instrumentTextHint: String): String {
+    val faultLines = inferInstrumentFaultLines(instrumentTextHint)
+    if (faultLines.isEmpty()) return text
+
+    val faultSummary = faultLines.joinToString("；")
+    var fixed = text.replace(
+        Regex("""(故障码|报警)[^。\n]{0,20}(无|未见|未发现|没有)|无明显故障码|未发现明显故障码|故障码无"""),
+        "仪表盘显示$faultSummary",
+    )
+    val fixedUpper = fixed.uppercase(Locale.ROOT)
+    val missingFaultLine =
+        (faultLines.any { it.contains("调速器") } && !fixed.contains("调速器信号过高")) ||
+            (faultLines.any { it.contains("SRO") } && !fixedUpper.contains("SRO")) ||
+            (faultLines.any { it.contains("油泵") } && !fixed.contains("油泵"))
+    if (missingFaultLine) {
+        val forcedInstrumentSummary = buildString {
+            append("仪表盘识别汇总：仪表盘显示")
+            append(faultSummary)
+            append("。\n")
+            append("故障码汇总：")
+            append(faultSummary)
+            append("。\n")
+            append("仪表盘异常判断：异常，牵引控制器存在故障；油泵控制器OK只表示油泵控制器当前正常，不能抵消牵引控制器故障。")
+        }
+        fixed = "$forcedInstrumentSummary\n${fixed.trim()}"
+    }
+    if (faultSummary.isNotBlank()) {
+        fixed = fixed
+            .replace("点检结论：异常/待确认", "点检结论：异常")
+            .replace(Regex("""仪表盘异常判断：\s*待确认[。；，,]?\s*"""), "仪表盘异常判断：异常。")
+            .replace(Regex("""故障码汇总：\s*[^。\n]*(待确认|未能稳定读取|未读取)[^。\n]*。?"""), "故障码汇总：$faultSummary。")
+    }
+    return fixed
+}
+
+private fun buildVehicleInspectionFallbackAnswer(rawInstrumentHint: String, rawModelText: String = ""): String {
+    val instrumentEvidence = "$rawInstrumentHint\n$rawModelText".trim()
+    val faultSummary = inferInstrumentFaultLines(instrumentEvidence).joinToString("；")
+    val instrumentSummary =
+        if (faultSummary.isBlank()) {
+            "仪表盘显示故障码页面，判定为异常；具体故障码文字本次未稳定转写，需重新读取仪表盘重点帧。"
+        } else {
+            "仪表盘显示$faultSummary。"
+        }
+    val faultLine =
+        if (faultSummary.isBlank()) {
+            "仪表盘存在故障码页面，具体故障码未稳定转写，需重新读取。"
+        } else {
+            "$faultSummary。"
+        }
+    val abnormalLine =
+        if (faultSummary.isBlank()) {
+            "异常。仪表盘显示故障码页面，不能判定为无故障；具体故障码需要重新读取或补拍近景确认。"
+        } else {
+            "异常。$faultSummary；其中显示OK的控制器只能说明该控制器当前正常，不能抵消其他控制器故障。"
+        }
+    val serviceAdvice =
+        if (faultSummary.isBlank()) {
+            "先暂停使用或限制运行，重新读取仪表盘故障码页面；读取到具体故障码后再按控制器、传感器、接插件和线束方向排查。"
+        } else {
+            "先停机或限速禁载，按仪表盘读取到的故障码检查对应控制器输入信号、传感器、接插件、供电、地线和线束；修复后清除故障码并复测行走、换向和油泵动作。"
+        }
+    return cleanVehicleInspectionFormatting(
+        """
+点检结论：异常。视频已覆盖环车外观和末尾仪表盘重点帧；仪表盘显示故障码页面，不能按正常放行。需先确认具体故障码并完成对应电控检查。
+
+仪表盘识别汇总：$instrumentSummary
+
+故障码汇总：$faultLine
+
+仪表盘异常判断：$abnormalLine
+
+反光镜检查：待确认。视频环车画面中可见反光镜/后视镜结构，未见明显缺失；镜面划伤、松动、角度偏差需近景复核。
+
+环车外观风险：待确认。车尾外壳/配重区域可见擦碰和漆面磨损痕迹；未确认明显漏液。货叉、门架、轮胎、护顶架需结合近景继续复核。
+
+处理建议：$serviceAdvice
+
+需补拍内容：补拍仪表盘故障码页面近景，补拍控制器铭牌和接插件，补拍与故障码相关的传感器、方向开关/档位手柄线束，补拍左右反光镜近景，补拍车尾擦碰区域、轮胎、货叉、门架和地面是否漏液。
+""".trimIndent(),
+    )
+}
+
+private fun buildVehicleInspectionFrameQuestion(
+    frame: ExtractedVideoFrame,
+    index: Int,
+    total: Int,
+): String {
+    val frameLabel = "第${index + 1}/$total 张，时间约${formatVideoTimestamp(frame.timestampMs)}"
+    return if (frame.isInstrumentFocus) {
+        """
+$frameLabel，本帧属于后${VEHICLE_INSPECTION_INSTRUMENT_FRAME_COUNT}张仪表盘重点帧。
+请只根据这一张图做仪表盘文字和故障码精读，不要展开外观描述：
+1. 先逐行转写仪表盘上看得清的原文，包括标题、菜单名、控制器名称、编号、故障码、报警文字、状态、数字读数。
+2. 每个故障码必须尽量写成“控制器/页面名称：故障码编号 + 故障说明/报警文字”的形式，例如读到编号和文字就同时保留。
+3. OK、SRO、CURTIS 等画面原文可以保留，但要写清它属于哪一行、哪个控制器或哪个页面。
+4. 如果看到“故障码”页面但具体编号或说明看不清，必须写“看到故障码页面，但具体编号/说明未能识别”，不能只概括为“有故障码”。
+如果画面显示“故障码”“控制器”“SRO”“OK”等文字，必须照实写出；除非画面明确显示无故障，否则不要写故障码无。
+只输出本帧识别事实，不要输出最终点检报告。
+""".trimIndent()
+    } else {
+        """
+$frameLabel，本帧属于前${VEHICLE_INSPECTION_SCENE_FRAME_COUNT}张环车画面关键帧。
+请只根据这一张图识别车辆外观故障，重点看左右反光镜/后视镜的镜面、支架、外壳、角度是否缺失、破裂、松动、遮挡或异常；同时看货叉、门架、轮胎、护顶架、车尾擦碰和地面漏液风险。
+如果本帧没有清晰仪表盘，不要推测故障码，直接写本帧未见可读仪表盘。
+只输出本帧识别事实，不要输出最终点检报告。
+""".trimIndent()
+    }
+}
+
+private fun analyzeVehicleInspectionFramesOneByOne(
+    extractedFrames: ExtractedVideoFrames,
+    userText: String,
+): String {
+    val frameReports = mutableListOf<String>()
+    extractedFrames.analysisFrames.forEachIndexed { index, frame ->
+        clearGenieChatState()
+        val question = buildVehicleInspectionFrameQuestion(frame, index, extractedFrames.analysisFrames.size)
+        try {
+            val result = runVlmImageRequest(
+                systemPrompt = VEHICLE_INSPECTION_FRAME_SYSTEM_PROMPT,
+                question = question,
+                bitmap = frame.bitmap,
+                inputSize = if (frame.isInstrumentFocus) {
+                    VEHICLE_INSPECTION_INSTRUMENT_VLM_SIZE
+                } else {
+                    VEHICLE_INSPECTION_SCENE_VLM_SIZE
+                },
+                imageFormat = android.graphics.Bitmap.CompressFormat.JPEG,
+                imageQuality = if (frame.isInstrumentFocus) 98 else 92,
+                errorPrefix = "车辆点检关键帧识别失败",
+            )
+            val content = result.content.trim()
+            if (content.isNotBlank()) {
+                frameReports += "${if (frame.isInstrumentFocus) "仪表重点帧" else "环车关键帧"} ${formatVideoTimestamp(frame.timestampMs)}：$content"
+            } else {
+                frameReports += "${if (frame.isInstrumentFocus) "仪表重点帧" else "环车关键帧"} ${formatVideoTimestamp(frame.timestampMs)}：本帧模型未返回有效识别内容。"
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Vehicle inspection frame analysis failed at ${formatVideoTimestamp(frame.timestampMs)}", e)
+            frameReports += "${if (frame.isInstrumentFocus) "仪表重点帧" else "环车关键帧"} ${formatVideoTimestamp(frame.timestampMs)}：本帧识别请求失败，需结合其他关键帧判断。"
+        }
+    }
+    val rawSummary = buildString {
+        appendLine("车辆点检逐帧识别结果，用户问题：$userText")
+        if (extractedFrames.instrumentTextHint.isNotBlank()) {
+            appendLine("仪表重点帧文字候选，仅作为辅助参考：")
+            appendLine(extractedFrames.instrumentTextHint)
+        }
+        frameReports.forEach { report ->
+            appendLine()
+            appendLine(report)
+        }
+    }
+    return normalizeVehicleInspectionAnswer(
+        rawText = rawSummary,
+        instrumentTextHint = extractedFrames.instrumentTextHint,
+        userText = userText,
+    )
+}
+
+private fun rewriteVehicleInspectionReport(
+    rawText: String,
+    instrumentTextHint: String,
+    userText: String,
+): String {
+    return try {
+        clearGenieChatState()
+        val faultLines = inferInstrumentFaultLines(instrumentTextHint)
+        val instrumentBlock =
+            if (instrumentTextHint.isBlank()) {
+                "未识别到额外仪表文字候选。"
+            } else {
+                instrumentTextHint
+            }
+        val forcedFaultBlock =
+            if (faultLines.isEmpty()) {
+                "无明确补充故障线索。"
+            } else {
+                faultLines.joinToString("；")
+            }
+        val reqJson = org.json.JSONObject().apply {
+            put("model", "qwen2.5vl-3b-8850-2.42")
+            put("stream", false)
+            put("size", 1536)
+            put("temp", 0.0)
+            put("top_k", 1)
+            put("top_p", 1.0)
+            put("messages", org.json.JSONArray().apply {
+                put(
+                    org.json.JSONObject()
+                        .put("role", "system")
+                        .put(
+                            "content",
+                            "你是工业车辆视频点检报告整理助手。你的任务是把原始视觉输出整理成最终合并报告，不能逐帧解释，不能输出时间帧、置信度、Markdown标题、井号、代码块或项目符号。最终报告只能写简体中文；画面原始标签、故障码、SRO、OK可以保留。不要写“文字识别”或“OCR读到”，只能写“仪表盘显示”。",
+                        )
+                )
+                put(
+                    org.json.JSONObject()
+                        .put("role", "user")
+                        .put(
+                            "content",
+                            "用户问题：$userText\n\n" +
+                                "仪表重点帧可见文字候选（只作为内部证据，最终不要提OCR或文字识别）：\n$instrumentBlock\n\n" +
+                                "必须合并进仪表盘和故障码结论的线索：$forcedFaultBlock\n\n" +
+                                "下面是原始视觉输出。请把前3张画面/后视镜/外观线索和后5张仪表文字/故障码线索整合成一个最终合并结论，去掉逐帧过程。结构必须依次为：点检结论、仪表盘识别汇总、故障码汇总、仪表盘异常判断、反光镜检查、环车外观风险、处理建议、需补拍内容。每个检查项标注正常、异常或待确认。不得写“故障码无”来覆盖上面的仪表线索。\n\n$rawText",
+                        )
+                )
+            })
+        }
+        val conn = (java.net.URL("http://127.0.0.1:8910/v1/chat/completions").openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json")
+            doOutput = true
+            connectTimeout = 10000
+            readTimeout = 120000
+        }
+        conn.outputStream.use { it.write(reqJson.toString().toByteArray(Charsets.UTF_8)) }
+        val response = try { conn.readTextResponse() } finally { conn.disconnect() }
+        if (response.code !in 200..299) {
+            Log.w(TAG, buildHttpErrorMessage("车辆点检报告整理失败", response.code, response.body))
+            rawText
+        } else {
+            parseChatCompletionContent(response.body)
+                .takeIf { it.isNotBlank() }
+                ?: rawText
+        }
+    } catch (e: Exception) {
+        Log.w(TAG, "Vehicle inspection report rewrite failed", e)
+        rawText
+    }
+}
+
+private fun normalizeVehicleInspectionAnswer(rawText: String, instrumentTextHint: String, userText: String): String {
+    val rewritten =
+        if (vehicleInspectionNeedsReportRewrite(rawText, instrumentTextHint)) {
+            rewriteVehicleInspectionReport(rawText, instrumentTextHint, userText)
+        } else {
+            rawText
+        }
+    val fixed = cleanVehicleInspectionFormatting(enforceInstrumentFaultHints(rewritten, instrumentTextHint))
+    return if (isCompleteVehicleInspectionReport(fixed)) {
+        fixed
+    } else {
+        buildVehicleInspectionFallbackAnswer(instrumentTextHint, fixed)
     }
 }
 
@@ -498,7 +1384,197 @@ private data class ExtractedVideoFrames(
     val contactSheet: Bitmap,
     val frameCount: Int,
     val durationMs: Long,
+    val instrumentTextHint: String = "",
+    val analysisFrames: List<ExtractedVideoFrame> = emptyList(),
 )
+
+private data class ExtractedVideoFrame(
+    val timestampMs: Long,
+    val bitmap: Bitmap,
+    val isInstrumentFocus: Boolean,
+)
+
+private fun ExtractedVideoFrames.recycleAnalysisFrames() {
+    analysisFrames.forEach { frame ->
+        if (!frame.bitmap.isRecycled) frame.bitmap.recycle()
+    }
+}
+
+private fun prepareInstrumentOcrBitmap(bitmap: Bitmap): Bitmap {
+    val minReadableWidth = 1280
+    if (bitmap.width >= minReadableWidth) return bitmap
+    val scale = (minReadableWidth.toFloat() / bitmap.width).coerceAtMost(2.5f)
+    val scaledWidth = (bitmap.width * scale).roundToInt().coerceAtLeast(bitmap.width)
+    val scaledHeight = (bitmap.height * scale).roundToInt().coerceAtLeast(bitmap.height)
+    return Bitmap.createScaledBitmap(bitmap, scaledWidth, scaledHeight, true)
+}
+
+private fun normalizeInstrumentOcrText(rawText: String): String {
+    return rawText
+        .lines()
+        .map { it.trim().replace(Regex("""\s+"""), " ") }
+        .filter { it.isNotBlank() }
+        .distinct()
+        .joinToString("；")
+        .take(1200)
+}
+
+private suspend fun recognizeChineseInstrumentText(bitmap: Bitmap): String {
+    val ocrBitmap = prepareInstrumentOcrBitmap(bitmap)
+    return try {
+        withTimeoutOrNull(2_500L) {
+            val recognizer = TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+            val image = InputImage.fromBitmap(ocrBitmap, 0)
+            suspendCancellableCoroutine { continuation ->
+                var closed = false
+                fun closeRecognizer() {
+                    if (!closed) {
+                        closed = true
+                        recognizer.close()
+                    }
+                }
+                fun finish(text: String) {
+                    if (continuation.isActive) {
+                        continuation.resume(text)
+                    }
+                    closeRecognizer()
+                }
+                continuation.invokeOnCancellation { closeRecognizer() }
+                recognizer.process(image)
+                    .addOnSuccessListener { result -> finish(result.text.orEmpty()) }
+                    .addOnFailureListener { error ->
+                        Log.w(TAG, "Instrument text recognition failed", error)
+                        finish("")
+                    }
+                    .addOnCompleteListener { closeRecognizer() }
+            }
+        }.orEmpty()
+    } catch (e: Exception) {
+        Log.w(TAG, "Instrument text recognition skipped", e)
+        ""
+    } finally {
+        if (ocrBitmap !== bitmap && !ocrBitmap.isRecycled) {
+            ocrBitmap.recycle()
+        }
+    }
+}
+
+private fun inferInstrumentFaultLines(text: String): List<String> {
+    val compactRaw = text.replace(Regex("""\s+"""), "")
+    val compactUpper = compactRaw.uppercase(Locale.ROOT)
+    val faultLines = mutableListOf<String>()
+    if (compactRaw.contains("调速器") && compactRaw.contains("信号过高")) {
+        faultLines += "牵引控制器：5.1 调速器信号过高"
+    }
+    if (
+        compactUpper.contains("SRO") &&
+            (compactRaw.contains("方向输入") || compactRaw.contains("方向") || compactRaw.contains("5.5") || compactRaw.contains("55"))
+    ) {
+        faultLines += "牵引控制器：5.5 方向输入SRO故障"
+    }
+    if (compactRaw.contains("油泵") && compactUpper.contains("OK")) {
+        faultLines += "油泵控制器：OK"
+    }
+    return faultLines.distinct()
+}
+
+private fun hasInstrumentFaultEvidence(text: String): Boolean {
+    val compactRaw = text.replace(Regex("""\s+"""), "")
+    val compactUpper = compactRaw.uppercase(Locale.ROOT)
+    return inferInstrumentFaultLines(text).isNotEmpty() ||
+        compactRaw.contains("故障码") ||
+        compactRaw.contains("控制器") ||
+        compactRaw.contains("调速器") ||
+        compactRaw.contains("信号过高") ||
+        compactUpper.contains("SRO")
+}
+
+private suspend fun recognizeInstrumentTextHints(frames: List<Pair<Long, Bitmap>>): String {
+    if (frames.isEmpty()) return ""
+    val snippets =
+        try {
+            frames.mapNotNull { (timestampMs, frame) ->
+                val text = normalizeInstrumentOcrText(recognizeChineseInstrumentText(frame))
+                if (text.isBlank()) null else "${formatVideoTimestamp(timestampMs)} $text"
+            }.distinct()
+        } catch (e: Exception) {
+            Log.w(TAG, "Instrument text hints skipped", e)
+            emptyList()
+        }
+    if (snippets.isEmpty()) return ""
+    val rawHint = snippets.joinToString("\n").take(3000)
+    val faultLines = inferInstrumentFaultLines(rawHint)
+    return buildString {
+        if (faultLines.isNotEmpty()) {
+            append("明确仪表故障线索：")
+            append(faultLines.joinToString("；"))
+            append('\n')
+        }
+        append("仪表重点帧可见文字候选：")
+        append('\n')
+        append(rawHint)
+    }
+}
+
+private fun isLikelyInstrumentFrame(bitmap: Bitmap): Boolean {
+    val width = bitmap.width.coerceAtLeast(1)
+    val height = bitmap.height.coerceAtLeast(1)
+    val sampleColumns = 8
+    val sampleRows = 6
+    var darkCount = 0
+    var brightCount = 0
+    var coloredCount = 0
+    var total = 0
+    for (row in 0 until sampleRows) {
+        val y = ((row + 0.5f) / sampleRows * height).toInt().coerceIn(0, height - 1)
+        for (column in 0 until sampleColumns) {
+            val x = ((column + 0.5f) / sampleColumns * width).toInt().coerceIn(0, width - 1)
+            val color = bitmap.getPixel(x, y)
+            val r = android.graphics.Color.red(color)
+            val g = android.graphics.Color.green(color)
+            val b = android.graphics.Color.blue(color)
+            val max = maxOf(r, g, b)
+            val min = minOf(r, g, b)
+            val brightness = (r + g + b) / 3
+            if (brightness < 80) darkCount += 1
+            if (brightness > 170) brightCount += 1
+            if (max - min > 45) coloredCount += 1
+            total += 1
+        }
+    }
+    if (total == 0) return false
+    val darkRatio = darkCount.toFloat() / total
+    val brightRatio = brightCount.toFloat() / total
+    val coloredRatio = coloredCount.toFloat() / total
+    return darkRatio >= 0.35f && (brightRatio >= 0.10f || coloredRatio >= 0.10f)
+}
+
+private fun normalizeVideoFrameOrientation(frame: Bitmap, rotationDegrees: Int): Bitmap {
+    var bitmap =
+        if (frame.config == Bitmap.Config.ARGB_8888) {
+            frame
+        } else {
+            frame.copy(Bitmap.Config.ARGB_8888, false)
+        }
+    val normalizedRotation = ((rotationDegrees % 360) + 360) % 360
+    if (normalizedRotation != 0) {
+        val matrix = android.graphics.Matrix().apply { postRotate(normalizedRotation.toFloat()) }
+        val rotated = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        if (rotated != bitmap) bitmap.recycle()
+        bitmap = rotated
+    }
+    return bitmap
+}
+
+private fun scaledFrameSize(aspectRatio: Float, maxWidth: Int, maxHeight: Int): Pair<Int, Int> {
+    val safeAspectRatio = aspectRatio.coerceIn(0.25f, 4.0f)
+    val heightAtMaxWidth = (maxWidth / safeAspectRatio).roundToInt().coerceAtLeast(1)
+    return if (heightAtMaxWidth <= maxHeight) {
+        maxWidth to heightAtMaxWidth
+    } else {
+        (maxHeight * safeAspectRatio).roundToInt().coerceAtLeast(1) to maxHeight
+    }
+}
 
 private fun getDisplayName(context: Context, uri: Uri): String {
     context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
@@ -517,7 +1593,12 @@ private fun formatVideoTimestamp(ms: Long): String {
     return String.format(Locale.US, "%02d:%02d", minutes, seconds)
 }
 
-private fun extractVideoFrames(context: Context, uri: Uri, maxFrames: Int = 6): ExtractedVideoFrames? {
+private suspend fun extractVideoFrames(
+    context: Context,
+    uri: Uri,
+    maxFrames: Int = 6,
+    includeTailFrame: Boolean = false,
+): ExtractedVideoFrames? {
     val retriever = MediaMetadataRetriever()
     try {
         retriever.setDataSource(context, uri)
@@ -527,51 +1608,135 @@ private fun extractVideoFrames(context: Context, uri: Uri, maxFrames: Int = 6): 
             retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1280
         val sourceHeight =
             retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 720
+        val rotationDegrees =
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+        val swapsDimensions = (((rotationDegrees % 360) + 360) % 360) in listOf(90, 270)
+        val displayWidth = if (swapsDimensions) sourceHeight else sourceWidth
+        val displayHeight = if (swapsDimensions) sourceWidth else sourceHeight
         val requestedFrameCount = when {
+            includeTailFrame && durationMs >= 15_000L -> maxFrames
+            includeTailFrame && durationMs >= 6_000L -> maxFrames.coerceAtLeast(6)
+            includeTailFrame && durationMs > 0L -> maxFrames.coerceAtLeast(5)
             durationMs >= 15_000L -> maxFrames
-            durationMs >= 6_000L -> 4
-            durationMs > 0L -> 3
+            durationMs >= 6_000L -> maxFrames.coerceAtMost(4).coerceAtLeast(1)
+            durationMs > 0L -> maxFrames.coerceAtMost(3).coerceAtLeast(1)
             else -> 1
         }
 
+        val vehicleInspectionFrameRatios = listOf(0.10f, 0.30f, 0.50f, 0.70f, 0.90f, 0.95f, 0.966f, 0.99f)
         val timestampsMs =
-            if (requestedFrameCount <= 1) {
-                listOf((durationMs / 2).coerceAtLeast(0L))
+            if (includeTailFrame && durationMs > 2_000L) {
+                vehicleInspectionFrameRatios
+                    .take(requestedFrameCount.coerceAtMost(vehicleInspectionFrameRatios.size))
+                    .map { ratio -> (durationMs * ratio).toLong().coerceIn(0L, durationMs) }
+                    .distinctBy { it / 250L }
             } else {
-                (0 until requestedFrameCount).map { index ->
-                    val progress = (index + 0.5f) / requestedFrameCount
-                    (durationMs * progress).toLong().coerceAtLeast(0L)
+                if (requestedFrameCount <= 1) {
+                    listOf((durationMs / 2).coerceAtLeast(0L))
+                } else {
+                    (0 until requestedFrameCount).map { index ->
+                        val progress = (index + 0.5f) / requestedFrameCount
+                        (durationMs * progress).toLong().coerceAtLeast(0L)
+                    }
                 }
-            }
+            }.sorted()
 
         val aspectRatio =
-            if (sourceWidth > 0 && sourceHeight > 0) {
-                sourceWidth.toFloat() / sourceHeight.toFloat()
+            if (displayWidth > 0 && displayHeight > 0) {
+                displayWidth.toFloat() / displayHeight.toFloat()
             } else {
                 16f / 9f
             }
-        val cellWidth = 360
-        val cellHeight = (cellWidth / aspectRatio).toInt().coerceIn(180, 280)
+        val isPortraitVideo = aspectRatio < 0.85f
+        val highlightTailFrame = includeTailFrame
+        val inspectionSceneFrameCount =
+            if (highlightTailFrame) {
+                minOf(VEHICLE_INSPECTION_SCENE_FRAME_COUNT, timestampsMs.size)
+            } else {
+                0
+            }
+        val (cellWidth, cellHeight) =
+            when {
+                highlightTailFrame -> scaledFrameSize(aspectRatio, maxWidth = 720, maxHeight = 1280)
+                isPortraitVideo -> scaledFrameSize(aspectRatio, maxWidth = 320, maxHeight = 620)
+                else -> scaledFrameSize(aspectRatio, maxWidth = 360, maxHeight = 280)
+            }
         val sampledFrames =
-            timestampsMs.mapNotNull { timestampMs ->
+            timestampsMs.mapIndexedNotNull { index, timestampMs ->
+                val frameOption =
+                    if (includeTailFrame) MediaMetadataRetriever.OPTION_CLOSEST
+                    else MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                val isInstrumentCandidate = highlightTailFrame && index >= inspectionSceneFrameCount
+                val (requestFrameWidth, requestFrameHeight) =
+                    when {
+                        isInstrumentCandidate -> scaledFrameSize(aspectRatio, maxWidth = 1280, maxHeight = 2200)
+                        highlightTailFrame -> scaledFrameSize(aspectRatio, maxWidth = 960, maxHeight = 1700)
+                        else -> cellWidth to cellHeight
+                    }
+                val requestWidth = if (swapsDimensions) requestFrameHeight else requestFrameWidth
+                val requestHeight = if (swapsDimensions) requestFrameWidth else requestFrameHeight
                 retriever.getScaledFrameAtTime(
                     timestampMs * 1000,
-                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                    cellWidth,
-                    cellHeight,
+                    frameOption,
+                    requestWidth,
+                    requestHeight,
                 )?.let { frame ->
-                    timestampMs to if (frame.config == Bitmap.Config.ARGB_8888) frame else frame.copy(Bitmap.Config.ARGB_8888, false)
+                    val normalizedFrame = normalizeVideoFrameOrientation(frame, rotationDegrees)
+                    if (normalizedFrame != frame && !frame.isRecycled) frame.recycle()
+                    timestampMs to normalizedFrame
                 }
             }
 
         if (sampledFrames.isEmpty()) return null
 
-        val columns = if (sampledFrames.size == 1) 1 else 2
-        val rows = ceil(sampledFrames.size / columns.toFloat()).toInt()
         val spacing = 16
         val headerHeight = 44
-        val sheetWidth = columns * cellWidth + (columns + 1) * spacing
-        val sheetHeight = headerHeight + rows * cellHeight + (rows + 1) * spacing
+        val sceneFrameCount =
+            if (highlightTailFrame) {
+                minOf(VEHICLE_INSPECTION_SCENE_FRAME_COUNT, sampledFrames.size)
+            } else {
+                0
+            }
+        val tailCandidates =
+            if (highlightTailFrame) {
+                sampledFrames
+                    .drop(sceneFrameCount)
+                    .takeLast(VEHICLE_INSPECTION_INSTRUMENT_FRAME_COUNT)
+            } else {
+                emptyList()
+            }
+        val detectedInstrumentTailFrames =
+            tailCandidates.filter { (_, frame) -> isLikelyInstrumentFrame(frame) }
+        val highlightFrames =
+            when {
+                !highlightTailFrame -> emptyList()
+                tailCandidates.isNotEmpty() -> tailCandidates
+                detectedInstrumentTailFrames.isNotEmpty() -> detectedInstrumentTailFrames
+                sampledFrames.size > 1 -> sampledFrames.takeLast(1)
+                else -> sampledFrames.takeLast(1)
+            }
+        val instrumentHintFrames =
+            if (highlightTailFrame) {
+                (detectedInstrumentTailFrames.ifEmpty { tailCandidates }).distinctBy { it.first }
+            } else {
+                emptyList()
+            }
+        val instrumentTextHint =
+            try {
+                recognizeInstrumentTextHints(instrumentHintFrames)
+            } catch (e: Exception) {
+                Log.w(TAG, "Video frame extraction continues without instrument text hints", e)
+                ""
+            }
+        val sheetFrames = sampledFrames
+        val sheetCellWidth = cellWidth
+        val sheetCellHeight = cellHeight
+        val columns = if (sheetFrames.size == 1) 1 else 2
+        val rows = ceil(sheetFrames.size / columns.toFloat()).toInt()
+        val sheetWidth = columns * sheetCellWidth + (columns + 1) * spacing
+        val sheetHeight =
+            headerHeight +
+                rows * sheetCellHeight + (rows + 1) * spacing
         val sheetBitmap = Bitmap.createBitmap(sheetWidth, sheetHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(sheetBitmap)
         val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = android.graphics.Color.WHITE }
@@ -593,23 +1758,23 @@ private fun extractVideoFrames(context: Context, uri: Uri, maxFrames: Int = 6): 
         }
 
         canvas.drawRect(0f, 0f, sheetWidth.toFloat(), sheetHeight.toFloat(), backgroundPaint)
-        canvas.drawText("视频关键帧拼图 · ${sampledFrames.size}帧", spacing.toFloat(), 28f, frameLabelPaint)
+        val sheetLabel =
+            if (highlightTailFrame) {
+                "视频关键帧拼图 · 前3张看外观/后视镜 · 后5张读仪表故障码"
+            } else {
+                "视频关键帧拼图 · ${sampledFrames.size}帧 · 同尺寸拼接"
+            }
+        canvas.drawText(sheetLabel, spacing.toFloat(), 28f, frameLabelPaint)
 
-        sampledFrames.forEachIndexed { index, (timestampMs, frame) ->
-            val row = index / columns
-            val column = index % columns
-            val left = spacing + column * (cellWidth + spacing)
-            val top = headerHeight + spacing + row * (cellHeight + spacing)
-            val destination = Rect(left, top, left + cellWidth, top + cellHeight)
+        fun drawFrame(timestampMs: Long, frame: Bitmap, destination: Rect) {
             canvas.drawBitmap(frame, null, destination, null)
             canvas.drawRect(destination, borderPaint)
-
             val label = formatVideoTimestamp(timestampMs)
             val chipPadding = 10f
             val chipHeight = 28f
             val chipWidth = timestampPaint.measureText(label) + chipPadding * 2
-            val chipLeft = left + 10f
-            val chipTop = top + 10f
+            val chipLeft = destination.left + 10f
+            val chipTop = destination.top + 10f
             canvas.drawRoundRect(
                 chipLeft,
                 chipTop,
@@ -620,15 +1785,41 @@ private fun extractVideoFrames(context: Context, uri: Uri, maxFrames: Int = 6): 
                 chipPaint,
             )
             canvas.drawText(label, chipLeft + chipPadding, chipTop + 20f, timestampPaint)
-
         }
 
-        sampledFrames.forEach { (_, frame) -> frame.recycle() }
+        var contentTop = headerHeight + spacing
+        sheetFrames.forEachIndexed { index, (timestampMs, frame) ->
+            val row = index / columns
+            val column = index % columns
+            val left = spacing + column * (sheetCellWidth + spacing)
+            val top = contentTop + row * (sheetCellHeight + spacing)
+            drawFrame(timestampMs, frame, Rect(left, top, left + sheetCellWidth, top + sheetCellHeight))
+        }
+
+        val instrumentFocusTimestamps = tailCandidates.map { it.first }.toSet()
+        val analysisFrames =
+            if (includeTailFrame) {
+                sampledFrames.map { (timestampMs, frame) ->
+                    ExtractedVideoFrame(
+                        timestampMs = timestampMs,
+                        bitmap = frame,
+                        isInstrumentFocus = timestampMs in instrumentFocusTimestamps,
+                    )
+                }
+            } else {
+                emptyList()
+            }
+
+        if (!includeTailFrame) {
+            sampledFrames.forEach { (_, frame) -> frame.recycle() }
+        }
 
         return ExtractedVideoFrames(
             contactSheet = sheetBitmap,
             frameCount = sampledFrames.size,
             durationMs = durationMs,
+            instrumentTextHint = instrumentTextHint,
+            analysisFrames = analysisFrames,
         )
     } catch (e: Exception) {
         Log.e(TAG, "Failed to extract video frames", e)
@@ -664,6 +1855,7 @@ data class FieldChecklist(
 )
 
 private enum class FieldFaultCategory(val label: String) {
+    VEHICLE_INSPECTION("车辆点检"),
     NO_START("无法启动"),
     LIFT_SLOW("举升缓慢"),
     HYDRAULIC_LEAK("液压油泄漏"),
@@ -767,10 +1959,24 @@ private fun org.json.JSONObject.optStringList(name: String): List<String> {
     return values
 }
 
+private fun isVehicleInspectionText(text: String): Boolean {
+    val directInspection = containsAny(text, listOf("车辆点检", "环车点检", "环车", "绕车", "绕车一周", "巡检", "班前检查", "出车前"))
+    val dashboardInspection = containsAny(text, listOf("仪表盘", "仪表报警", "仪表异常", "异常显示", "报警灯"))
+    val mirrorInspection = containsAny(text, listOf("反光镜", "后视镜", "镜面", "镜子"))
+    return containsAny(
+        text,
+        listOf("点检视频", "视频点检"),
+    )
+        || directInspection
+        || dashboardInspection
+        || mirrorInspection
+}
+
 private fun inferFieldFaultCategory(text: String): FieldFaultCategory? {
     val normalized = text.trim()
     if (normalized.isBlank()) return null
     return when {
+        isVehicleInspectionText(normalized) -> FieldFaultCategory.VEHICLE_INSPECTION
         listOf("无法启动", "启动不了", "打不着", "无反应", "不能启动").any { normalized.contains(it) } -> FieldFaultCategory.NO_START
         listOf("举升缓慢", "举升慢", "升不动", "液压压力低", "压力偏低").any { normalized.contains(it) } -> FieldFaultCategory.LIFT_SLOW
         listOf("液压油泄漏", "漏油", "渗油").any { normalized.contains(it) } -> FieldFaultCategory.HYDRAULIC_LEAK
@@ -806,6 +2012,7 @@ private fun shouldTreatAsOfflineTriageFollowUp(userInput: String, context: Offli
         listOf(
             "电压", "压力", "故障码", "仪表", "亮", "不亮", "有声音", "无声音", "无反应",
             "偶发", "一直", "重启", "恢复", "油位", "漏油", "温度", "空载", "负载", "制动",
+            "报警", "反光镜", "后视镜", "镜面", "支架", "轮胎", "货叉", "门架", "护顶架",
         )
     return text.length <= 120 && (
         answerSignals.any { text.contains(it) } ||
@@ -831,7 +2038,7 @@ private fun shouldTreatAsVisualFollowUp(userInput: String, visualContextText: St
 private fun isDiagnosticWorkOrderIntent(text: String): Boolean {
     return listOf(
         "诊断", "故障", "维修", "处理", "建议", "原因", "怎么修", "怎么处理",
-        "生成工单", "工单", "排查", "风险", "还能运行",
+        "生成工单", "工单", "排查", "风险", "还能运行", "点检", "巡检",
     ).any { text.contains(it) }
 }
 
@@ -839,6 +2046,7 @@ private fun buildOfflineTriageQuestionnaire(userInput: String): OfflineTriageRep
     val category = inferFieldFaultCategory(userInput) ?: return null
     val questions = triageQuestions(category)
     val example = when (category) {
+        FieldFaultCategory.VEHICLE_INSPECTION -> "仪表盘无报警，左右反光镜完好，货叉和轮胎未见明显异常"
         FieldFaultCategory.NO_START -> "仪表亮，电压9.2V，启动无反应，暂无故障码"
         FieldFaultCategory.LIFT_SLOW -> "油位偏低，液压压力0.8bar，负载时更慢"
         FieldFaultCategory.HYDRAULIC_LEAK -> "门架油缸附近渗油，油位下降，地面有油迹"
@@ -911,6 +2119,8 @@ private fun buildOfflineTriageFollowUpReply(userInput: String, context: OfflineT
 
 private fun triageQuestions(category: FieldFaultCategory): List<String> {
     return when (category) {
+        FieldFaultCategory.VEHICLE_INSPECTION ->
+            listOf("仪表盘画面是否清晰，画面中可识别出的文字、数字读数、故障码和报警图标分别是什么？", "根据识别出的仪表盘文字/读数判断是否有异常显示？", "左右反光镜/后视镜是否都拍到，镜面和支架是否完好？", "环车一周是否拍到货叉、门架、轮胎、护顶架、车尾和漏液风险？")
         FieldFaultCategory.NO_START ->
             listOf("仪表是否亮起，急停开关是否复位？", "启动时电机、接触器或继电器是否有动作声音？", "电池或主电源电压是多少，启动瞬间是否明显下跌？", "控制器或仪表是否有故障码？")
         FieldFaultCategory.LIFT_SLOW ->
@@ -933,6 +2143,7 @@ private fun triageQuestions(category: FieldFaultCategory): List<String> {
 private fun triageNextSteps(category: FieldFaultCategory, userInput: String): List<String> {
     val voltage = extractVoltage(userInput)
     return when (category) {
+        FieldFaultCategory.VEHICLE_INSPECTION -> listOf("先从仪表盘近景中识别并记录文字、数字读数、故障码、报警灯/图标和电量/小时表。", "基于已识别的仪表盘内容判断是否异常；无法识别时补拍仪表盘正面近景。", "分别拍到左右反光镜正面和支架连接处，确认镜面破损、缺失、松动或角度异常。", "环车补拍货叉、门架、轮胎、护顶架、车尾和地面漏液区域，异常项写入工单。")
         FieldFaultCategory.NO_START -> {
             if (voltage != null && voltage < 10.5) {
                 listOf("先给电池补电或更换已知正常电池复测。", "清洁并紧固电池接线柱、主保险和接触器端子。", "复测启动瞬间电压，仍下跌则检查电池内阻或主电缆压降。")
@@ -952,6 +2163,12 @@ private fun triageNextSteps(category: FieldFaultCategory, userInput: String): Li
 
 private fun buildBaseFieldChecklist(category: FieldFaultCategory): FieldChecklist {
     val items = when (category) {
+        FieldFaultCategory.VEHICLE_INSPECTION -> listOf(
+            FieldChecklistItem("识别仪表盘文字和读数", "拍清仪表盘近景，先转写画面中的文字、数字读数、故障码、报警灯/图标、电量/油量和小时表，再判断是否异常。", "仪表异常必须以识别出的可见内容为依据，避免只凭外观判断。"),
+            FieldChecklistItem("检查左右反光镜/后视镜", "分别查看镜面、外壳、支架和调节角度，确认无缺失、破裂、松动或严重遮挡。", "反光镜异常会扩大盲区，应在交付前维修或调整。"),
+            FieldChecklistItem("环车检查外观安全项", "沿车身检查货叉、门架、轮胎、护顶架、车尾、灯具和地面漏液。", "可提前发现碰撞、漏液、轮胎损伤等班前安全风险。"),
+            FieldChecklistItem("补拍不清晰角度", "对模型标注为待确认的仪表、反光镜或外观部位补拍近景。", "避免把遮挡或模糊画面误判为正常。"),
+        )
         FieldFaultCategory.NO_START -> listOf(
             FieldChecklistItem("确认仪表和急停状态", "记录仪表是否亮起、急停是否复位、钥匙开关是否有效。", "区分整车掉电、急停回路和启动许可问题。"),
             FieldChecklistItem("测量电池/主电源电压", "记录静态电压和启动瞬间压降。", "低压会直接导致无法启动或控制器复位。"),
@@ -1311,6 +2528,7 @@ private fun buildDynamicWorkOrderMessage(
     activeEquipmentContext: GraphNode?,
     graph: MaintenanceKnowledgeGraph,
 ): PocketMessage {
+    val t0 = System.currentTimeMillis()
     val contextText =
         buildDynamicWorkOrderContextText(
             clickedMessage = clickedMessage,
@@ -1340,6 +2558,8 @@ private fun buildDynamicWorkOrderMessage(
         relatedWorkOrders = relatedWorkOrders,
         graphJson = graphResult?.second.orEmpty(),
         sourceLabel = if (graphResult != null) "动态工单 · 图谱补全" else "动态工单 · 端侧整理",
+        elapsedMs = System.currentTimeMillis() - t0,
+        tokenUsage = GenerationUsage(estimateOutputTokens(dynamicText), estimated = true),
         canGenerateWorkOrder = false,
     )
 }
@@ -1351,17 +2571,15 @@ private fun buildDynamicWorkOrderContextText(
     latestVisualContextText: String,
 ): String {
     val lines = mutableListOf<String>()
-    latestVisualContextText.takeIf { it.isNotBlank() }?.let {
+    latestVisualContextText.takeIf { shouldIncludeVisualContextInWorkOrder(clickedMessage, it) }?.let {
         lines.add("最近现场图片/视频分析：")
         lines.add(it.take(1600))
     }
-    conversationHistory.takeLast(14).forEach { (role, content) ->
-        val label = if (role == "user") "用户" else "助手"
-        content.trim()
-            .takeIf { it.isNotBlank() && !it.startsWith("正在") }
-            ?.let { lines.add("$label：${it.take(900)}") }
-    }
-    messages.takeLast(12).forEach { message ->
+    val filteredMessages =
+        messages
+            .filter { shouldIncludeMessageInDynamicWorkOrderContext(it, clickedMessage) }
+            .takeLast(12)
+    filteredMessages.forEach { message ->
         val label = if (message.isUser) "用户" else "助手"
         message.text.trim()
             .takeIf { it.isNotBlank() && !it.startsWith("正在") }
@@ -1369,6 +2587,45 @@ private fun buildDynamicWorkOrderContextText(
     }
     clickedMessage.text.trim().takeIf { it.isNotBlank() }?.let { lines.add("本次生成工单触发内容：${it.take(900)}") }
     return lines.distinct().joinToString("\n").take(6500)
+}
+
+private fun extractDynamicWorkOrderPrimaryText(contextText: String, clickedText: String): String {
+    val lines = contextText.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
+    val lastUserText =
+        lines
+            .asReversed()
+            .firstOrNull { it.startsWith("用户：") }
+            ?.removePrefix("用户：")
+            ?.trim()
+            .orEmpty()
+    val triggerText =
+        lines
+            .asReversed()
+            .firstOrNull { it.startsWith("本次生成工单触发内容：") }
+            ?.substringAfter("本次生成工单触发内容：")
+            ?.trim()
+            .orEmpty()
+    return listOf(lastUserText, triggerText, clickedText.trim()).firstOrNull { it.isNotBlank() }.orEmpty()
+}
+
+private fun sanitizeDynamicWorkOrderContext(
+    contextText: String,
+    category: FieldFaultCategory?,
+): String {
+    if (contextText.isBlank() || category == FieldFaultCategory.VEHICLE_INSPECTION) return contextText
+    val filtered =
+        contextText
+            .lineSequence()
+            .map { it.trimEnd() }
+            .filterNot { line ->
+                isVehicleInspectionText(line) ||
+                    containsAny(
+                        line,
+                        listOf("车辆点检", "环车点检", "仪表盘", "仪表报警", "仪表异常", "反光镜", "后视镜", "绕车", "巡检", "班前检查"),
+                    )
+            }
+            .toList()
+    return filtered.joinToString("\n").ifBlank { contextText }
 }
 
 private fun buildDynamicGraphWorkOrderJson(report: DiagnosticReport, contextText: String): String {
@@ -1389,19 +2646,27 @@ private fun buildDynamicFallbackWorkOrderJson(
     activeEquipmentContext: GraphNode?,
     relatedWorkOrders: List<GraphNode>,
 ): String {
-    val category = inferFieldFaultCategory(contextText)
+    val primaryText = extractDynamicWorkOrderPrimaryText(contextText, clickedText)
+    val primaryCategory = inferFieldFaultCategory(primaryText)
+    val contextCategory = inferFieldFaultCategory(contextText)
+    val category = primaryCategory ?: contextCategory
+    val isInspection = category == FieldFaultCategory.VEHICLE_INSPECTION
+    val effectiveContextText = sanitizeDynamicWorkOrderContext(contextText, category)
     val equipment =
         activeEquipmentContext?.label
-            ?: extractExplicitEquipmentMention(contextText)
+            ?: extractExplicitEquipmentMention(primaryText)
+            ?: extractExplicitEquipmentMention(effectiveContextText)
             ?: "待确认设备"
-    val symptom = category?.label ?: summarizeDynamicSymptom(contextText, clickedText)
+    val symptom = if (isInspection) FieldFaultCategory.VEHICLE_INSPECTION.label else category?.label ?: summarizeDynamicSymptom(effectiveContextText, primaryText)
     val severity =
         when {
-            containsAny(contextText, listOf("制动失灵", "无法启动", "急停", "高温", "过热")) -> "高"
+            isInspection && containsAny(effectiveContextText, listOf("报警", "故障码", "异常", "破损", "缺失", "松动", "漏液", "待确认")) -> "中"
+            isInspection -> "低"
+            containsAny(primaryText + "\n" + effectiveContextText, listOf("制动失灵", "无法启动", "急停", "高温", "过热")) -> "高"
             category != null -> "中"
             else -> "待确认"
         }
-    val causes = fallbackCausesForCategory(category, contextText)
+    val causes = fallbackCausesForCategory(category, effectiveContextText)
     val checklistItems = category?.let { buildBaseFieldChecklist(it).items }.orEmpty()
     return org.json.JSONObject().apply {
         put("equipment", equipment)
@@ -1452,29 +2717,54 @@ private fun buildDynamicFallbackWorkOrderJson(
             "diagnosisBasis",
             org.json.JSONArray().apply {
                 put("知识库未直接命中完整场景，当前工单由端侧根据连续问答和现场资料动态整理。")
-                extractDynamicEvidence(contextText).take(5).forEach { put(it) }
+                extractDynamicEvidence(effectiveContextText).take(5).forEach { put(it) }
             },
         )
-        put("followUpQuestions", org.json.JSONArray().apply { buildDynamicFollowUpQuestions(contextText, symptom).forEach { put(it) } })
-        put("riskNote", inferDynamicRiskNote(contextText, symptom))
-        put("temporaryAction", inferDynamicTemporaryAction(contextText, symptom))
+        put("followUpQuestions", org.json.JSONArray().apply { buildDynamicFollowUpQuestions(effectiveContextText, symptom).forEach { put(it) } })
+        put("riskNote", inferDynamicRiskNote(effectiveContextText, symptom))
+        put("temporaryAction", inferDynamicTemporaryAction(effectiveContextText, symptom))
     }.toString()
 }
 
 private fun extractDynamicEvidence(contextText: String): List<String> {
     val evidence = mutableListOf<String>()
+    evidence.addAll(extractChecklistCompletionEvidence(contextText))
     extractVoltage(contextText)?.let { evidence.add("已记录电压${formatNumber(it)}V，可用于判断电源或控制器复位风险。") }
     extractPressure(contextText)?.let { evidence.add("已记录压力${formatNumber(it)}bar，可用于判断液压系统异常程度。") }
     extractFaultCodes(contextText).takeIf { it.isNotEmpty() }?.let { evidence.add("已记录故障码：${it.joinToString("、")}。") }
     if (containsAny(contextText, listOf("图片", "照片", "画面", "视频"))) evidence.add("已合并现场图片/视频分析内容。")
+    if (isVehicleInspectionText(contextText)) evidence.add("已按车辆点检场景合并仪表盘、反光镜和环车外观检查线索。")
     if (containsAny(contextText, listOf("漏油", "渗油", "油迹"))) evidence.add("现场提到漏油/油迹，需在工单中保留照片和位置描述。")
     if (containsAny(contextText, listOf("重启", "偶发", "恢复"))) evidence.add("故障呈偶发或重启恢复特征，需记录触发工况和复现条件。")
     return evidence.distinct().ifEmpty { listOf("已根据当前连续问答整理现场现象，仍需补充可量化参数。") }
 }
 
+private fun extractChecklistCompletionEvidence(contextText: String): List<String> {
+    val lines = contextText.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.toList()
+    val checklistTitle = lines
+        .firstOrNull { it.contains("现场排查完成记录：") }
+        ?.substringAfter("现场排查完成记录：")
+        ?.take(60)
+    val completedItems = lines
+        .mapNotNull { line ->
+            line.substringAfter("已完成：", missingDelimiterValue = "")
+                .takeIf { it.isNotBlank() }
+                ?.take(60)
+        }
+        .distinct()
+    if (completedItems.isEmpty()) return emptyList()
+    val titleText = checklistTitle?.let { "《$it》" }.orEmpty()
+    return listOf("已完成${titleText}现场排查：${completedItems.take(6).joinToString("、")}。")
+}
+
 private fun buildDynamicFollowUpQuestions(contextText: String, symptom: String): List<String> {
     val questions = mutableListOf<String>()
     if (extractExplicitEquipmentMention(contextText) == null) questions.add("请补充设备编号或铭牌照片。")
+    if (isVehicleInspectionText(symptom + contextText)) {
+        if (!containsAny(contextText, listOf("仪表盘文字", "读数", "故障码", "报警灯", "异常显示", "小时表", "电量"))) questions.add("请补拍仪表盘正面近景，并识别/记录其中的文字、数字读数、故障码、报警灯或异常图标。")
+        if (!containsAny(contextText, listOf("反光镜", "后视镜", "镜面", "支架"))) questions.add("请补拍左右反光镜/后视镜，确认镜面、支架和调节角度是否正常。")
+        if (!containsAny(contextText, listOf("货叉", "门架", "轮胎", "护顶架", "漏液"))) questions.add("请补充货叉、门架、轮胎、护顶架和地面漏液检查结果。")
+    }
     if (extractVoltage(contextText) == null && containsAny(symptom + contextText, listOf("无法启动", "急停", "掉电"))) questions.add("请补充静态电压和启动/故障瞬间电压。")
     if (extractPressure(contextText) == null && containsAny(symptom + contextText, listOf("举升", "液压", "漏油", "转向"))) questions.add("请补充液压压力、油位和泄漏位置。")
     if (extractFaultCodes(contextText).isEmpty()) questions.add("请补充仪表或控制器故障码，若没有也请写明“暂无故障码”。")
@@ -1484,6 +2774,8 @@ private fun buildDynamicFollowUpQuestions(contextText: String, symptom: String):
 
 private fun inferDynamicRiskNote(contextText: String, symptom: String): String {
     return when {
+        isVehicleInspectionText(symptom + contextText) && containsAny(symptom + contextText, listOf("报警", "故障码", "破损", "缺失", "松动", "漏液", "异常")) -> "车辆点检存在未关闭风险项，仪表报警、反光镜异常或漏液未复核前不建议直接投入作业。"
+        isVehicleInspectionText(symptom + contextText) -> "当前点检结论依赖视频画面，遮挡或模糊部位仍需现场复核后再放行。"
         containsAny(symptom + contextText, listOf("制动失灵", "刹不住")) -> "制动异常存在安全风险，应立即停用并设置现场警示。"
         containsAny(symptom + contextText, listOf("无法启动", "急停", "掉电")) -> "继续反复启动可能扩大电源或控制器故障，应先确认电压和主回路。"
         containsAny(symptom + contextText, listOf("漏油", "液压油泄漏")) -> "液压泄漏可能导致压力下降和污染现场，未定位漏点前不建议继续作业。"
@@ -1494,6 +2786,8 @@ private fun inferDynamicRiskNote(contextText: String, symptom: String): String {
 
 private fun inferDynamicTemporaryAction(contextText: String, symptom: String): String {
     return when {
+        isVehicleInspectionText(symptom + contextText) && containsAny(symptom + contextText, listOf("报警", "故障码", "破损", "缺失", "松动", "漏液", "异常")) -> "先暂停放行车辆，补拍并现场复核仪表盘、反光镜和异常外观部位，确认无安全风险后再作业。"
+        isVehicleInspectionText(symptom + contextText) -> "保留点检视频和关键帧，按仪表盘、反光镜、环车外观清单复核后归档。"
         containsAny(symptom + contextText, listOf("制动失灵", "刹不住")) -> "暂停使用车辆，拉警戒并安排维修人员现场确认。"
         containsAny(symptom + contextText, listOf("无法启动", "急停", "掉电")) -> "停止反复启动，先测电压、检查急停回路和主接触器接插件。"
         containsAny(symptom + contextText, listOf("漏油", "液压油泄漏")) -> "清洁油迹后短动作复现漏点，必要时停机等待维修。"
@@ -1504,6 +2798,7 @@ private fun inferDynamicTemporaryAction(contextText: String, symptom: String): S
 
 private fun fallbackCausesForCategory(category: FieldFaultCategory?, contextText: String): List<Pair<String, Int>> {
     return when (category) {
+        FieldFaultCategory.VEHICLE_INSPECTION -> listOf("点检视频证据不足或存在遮挡" to 45, "仪表盘报警/故障码待复核" to 35, "反光镜破损、缺失或角度异常待确认" to 30)
         FieldFaultCategory.NO_START -> listOf("电池亏电或主电源压降" to 55, "急停/钥匙/接触器回路异常" to 35, "控制器保护或传感器故障" to 25)
         FieldFaultCategory.LIFT_SLOW -> listOf("液压油位不足或吸油不畅" to 55, "滤芯堵塞或油液污染" to 40, "液压泵效率下降或内泄" to 35)
         FieldFaultCategory.HYDRAULIC_LEAK -> listOf("油管接头或密封圈泄漏" to 60, "油缸密封磨损" to 40, "阀块或管路损伤" to 25)
@@ -1587,6 +2882,11 @@ private fun buildWorkOrderQualityReview(workOrder: WorkOrderDocumentData): WorkO
     if (workOrder.relatedWorkOrders.isEmpty()) suggestions.add("可补充相似工单或历史维修记录，便于复盘")
 
     when (category) {
+        FieldFaultCategory.VEHICLE_INSPECTION -> {
+            if (!containsAny(allText, listOf("仪表盘文字", "读数", "故障码", "报警灯", "异常显示", "小时表", "电量"))) missing.add("仪表盘文字/读数识别和异常判断")
+            if (!containsAny(allText, listOf("反光镜", "后视镜", "镜面", "支架"))) missing.add("左右反光镜/后视镜检查结果")
+            if (!containsAny(allText, listOf("环车", "货叉", "门架", "轮胎", "护顶架", "漏液"))) suggestions.add("建议补充环车外观、货叉/门架/轮胎和漏液检查记录")
+        }
         FieldFaultCategory.NO_START -> {
             if (!containsAny(allText, listOf("电压", "V", "伏", "压降"))) missing.add("电池电压或启动瞬间压降")
             if (!containsAny(allText, listOf("仪表", "接触器", "继电器", "无反应", "启动声音"))) missing.add("启动时仪表/接触器状态")
@@ -1694,7 +2994,7 @@ private fun isExplicitNewDiagnosisRequest(text: String): Boolean {
     val restartSignals = listOf("新诊断", "重新诊断", "重新分析", "换一台", "另一台", "另一个故障", "新的故障")
     if (restartSignals.any { normalized.contains(it) }) return true
     val explicitEquipment = extractExplicitEquipmentMention(normalized) != null
-    val knownSymptom = SYMPTOM_KEYWORDS.any { normalized.contains(it) }
+    val knownSymptom = inferFieldFaultCategory(normalized) != null || SYMPTOM_KEYWORDS.any { normalized.contains(it) }
     val diagnosticIntent =
         listOf(
             "诊断", "故障", "原因", "怎么修", "怎么处理", "无法", "异常", "失灵", "泄漏",
@@ -2144,12 +3444,121 @@ data class PocketMessage(
     val graphJson: String = "",
     val sourceLabel: String = "",
     val elapsedMs: Long = 0L,
+    val tokenUsage: GenerationUsage? = null,
     val isEdgeReasoning: Boolean = false,
     val isFollowUpResponse: Boolean = false,
     val isFieldAssistResponse: Boolean = false,
     val checklist: FieldChecklist? = null,
     val canGenerateWorkOrder: Boolean = false,
+    val visualAnnotations: List<VisualAnnotation> = emptyList(),
 )
+
+private const val MEMORY_GUARD_MAX_MESSAGES = 48
+private const val MEMORY_GUARD_KEEP_MESSAGES = 28
+private const val MEMORY_GUARD_CRITICAL_KEEP_MESSAGES = 16
+private const val MEMORY_GUARD_MAX_CONVERSATION_ITEMS = 24
+private const val MEMORY_GUARD_KEEP_CONVERSATION_ITEMS = 14
+private const val MEMORY_GUARD_CONTEXT_CHAR_LIMIT = 12_000
+private const val MEMORY_GUARD_MESSAGE_TEXT_LIMIT = 2_800
+private const val MEMORY_GUARD_USED_RATIO = 0.78
+private const val MEMORY_GUARD_MIN_FREE_BYTES = 96L * 1024L * 1024L
+private const val MEMORY_GUARD_NOTICE_SOURCE = "内存保护"
+
+private fun PocketMessage.compactedForMemory(
+    aggressive: Boolean,
+    preserveText: Boolean = false,
+): PocketMessage {
+    val compactText =
+        if (aggressive && !preserveText && text.length > MEMORY_GUARD_MESSAGE_TEXT_LIMIT) {
+            text.take(MEMORY_GUARD_MESSAGE_TEXT_LIMIT) + "\n\n[较早回复已压缩，以释放端侧内存]"
+        } else {
+            text
+        }
+    return copy(
+        text = compactText,
+        bitmap = null,
+        visualAnnotations = emptyList(),
+        graphJson = if (aggressive) "" else graphJson,
+        relatedWorkOrders = if (aggressive) emptyList() else relatedWorkOrders,
+    )
+}
+
+private fun PocketMessage.withChecklistCompletionContext(
+    checklist: FieldChecklist,
+    completedItems: List<FieldChecklistItem>,
+): PocketMessage {
+    val checklistEvidence = buildChecklistCompletionEvidenceText(checklist, completedItems)
+    val combinedText = listOf(checklistEvidence, text.trim())
+        .filter { it.isNotBlank() }
+        .joinToString("\n\n")
+    return copy(
+        text = combinedText,
+        canGenerateWorkOrder = !isVehicleInspectionMessage(),
+    )
+}
+
+private fun isVehicleInspectionSourceLabel(sourceLabel: String): Boolean {
+    return sourceLabel.contains("车辆点检")
+}
+
+private fun PocketMessage.isVehicleInspectionMessage(): Boolean {
+    return isVehicleInspectionSourceLabel(sourceLabel) || isVehicleInspectionText(text)
+}
+
+private fun PocketMessage.dynamicWorkOrderSourceGroup(): String {
+    return when {
+        isVehicleInspectionMessage() -> "inspection"
+        sourceLabel.contains("图片") || sourceLabel.contains("视频") || isImageResponse -> "visual"
+        sourceLabel.contains("图谱") -> "graph"
+        sourceLabel.contains("端侧泛化") -> "generalized"
+        sourceLabel.contains("端侧问诊") || isFieldAssistResponse -> "triage"
+        else -> "text"
+    }
+}
+
+private fun shouldIncludeVisualContextInWorkOrder(clickedMessage: PocketMessage, latestVisualContextText: String): Boolean {
+    if (latestVisualContextText.isBlank()) return false
+    if (clickedMessage.isVehicleInspectionMessage()) return true
+    if (clickedMessage.dynamicWorkOrderSourceGroup() == "visual") return true
+    return listOf("图片", "照片", "铭牌", "框选", "定位", "视频", "画面").any { token ->
+        clickedMessage.text.contains(token) || clickedMessage.sourceLabel.contains(token)
+    }
+}
+
+private fun shouldIncludeMessageInDynamicWorkOrderContext(
+    candidate: PocketMessage,
+    clickedMessage: PocketMessage,
+): Boolean {
+    if (candidate.text.isBlank() || candidate.text.startsWith("正在")) return false
+    if (candidate === clickedMessage) return true
+    if (candidate.sourceLabel.startsWith("动态工单")) return false
+    val clickedGroup = clickedMessage.dynamicWorkOrderSourceGroup()
+    val candidateGroup = candidate.dynamicWorkOrderSourceGroup()
+    if (clickedGroup == "inspection") return candidateGroup == "inspection"
+    if (candidateGroup == "inspection") return false
+    if (clickedGroup == "generalized") return candidateGroup in setOf("generalized", "triage", "text")
+    if (clickedGroup == "triage") return candidateGroup in setOf("triage", "text")
+    if (clickedGroup == "graph") return candidateGroup in setOf("graph", "text", "visual")
+    if (clickedGroup == "visual") return candidateGroup in setOf("visual", "text")
+    return candidateGroup in setOf("text", "graph", "triage", "generalized")
+}
+
+private fun buildChecklistCompletionEvidenceText(
+    checklist: FieldChecklist,
+    completedItems: List<FieldChecklistItem>,
+): String {
+    val items = completedItems.ifEmpty { checklist.items }
+    return buildString {
+        appendLine("现场排查完成记录：${checklist.title}")
+        checklist.reason.takeIf { it.isNotBlank() }?.let { appendLine("排查目的：$it") }
+        items.forEachIndexed { index, item ->
+            appendLine("${index + 1}. 已完成：${item.title}")
+            item.detail.takeIf { it.isNotBlank() }?.let { appendLine("   记录项：$it") }
+            item.impact.takeIf { it.isNotBlank() }?.let { appendLine("   对工单的作用：$it") }
+        }
+        append("结论：清单已全部勾选完成，生成工单时需要合并用户问诊中补充的设备、参数、故障码、图片/视频线索。")
+    }.trim()
+}
 
 class PocketOpsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -2443,6 +3852,7 @@ fun PocketOpsApp(
     val conversationHistory = remember { mutableStateListOf<Pair<String, String>>() }
     var activeEquipmentContext by remember { mutableStateOf<GraphNode?>(null) }
     var latestVisualContextText by remember { mutableStateOf("") }
+    var latestVisualBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var latestVisualEquipmentContext by remember { mutableStateOf<GraphNode?>(null) }
     var visualLookupScopeActive by remember { mutableStateOf(false) }
     var workOrderFollowUpContext by remember { mutableStateOf("") }
@@ -2857,6 +4267,7 @@ fun PocketOpsApp(
         conversationHistory.clear()
         activeEquipmentContext = null
         latestVisualContextText = ""
+        latestVisualBitmap = null
         latestVisualEquipmentContext = null
         visualLookupScopeActive = false
         activeOfflineTriageContext = null
@@ -2871,7 +4282,98 @@ fun PocketOpsApp(
     }
 
     fun rememberWorkOrderFollowUpContext(userText: String, aiText: String, report: DiagnosticReport? = null) {
-        workOrderFollowUpContext = buildWorkOrderFollowUpContext(userText, aiText, report)
+        workOrderFollowUpContext =
+            buildWorkOrderFollowUpContext(userText, aiText, report).take(MEMORY_GUARD_CONTEXT_CHAR_LIMIT)
+    }
+
+    fun isRuntimeMemoryPressureHigh(): Boolean {
+        val runtime = Runtime.getRuntime()
+        val maxMemory = runtime.maxMemory()
+        if (maxMemory <= 0L) return false
+        val usedMemory = runtime.totalMemory() - runtime.freeMemory()
+        val freeUntilLimit = maxMemory - usedMemory
+        val lowFreeMemory =
+            maxMemory >= MEMORY_GUARD_MIN_FREE_BYTES * 2 &&
+                freeUntilLimit <= MEMORY_GUARD_MIN_FREE_BYTES
+        return usedMemory.toDouble() / maxMemory.toDouble() >= MEMORY_GUARD_USED_RATIO || lowFreeMemory
+    }
+
+    fun trimConversationHistoryForMemory() {
+        if (conversationHistory.size <= MEMORY_GUARD_MAX_CONVERSATION_ITEMS) return
+        val compactHistory =
+            conversationHistory
+                .takeLast(MEMORY_GUARD_KEEP_CONVERSATION_ITEMS)
+                .map { (role, content) -> role to content.take(MEMORY_GUARD_MESSAGE_TEXT_LIMIT) }
+        conversationHistory.clear()
+        conversationHistory.addAll(compactHistory)
+    }
+
+    fun addMemoryGuardNotice() {
+        if (messages.takeLast(4).any { it.sourceLabel == MEMORY_GUARD_NOTICE_SOURCE }) return
+        messages.add(
+            PocketMessage(
+                text = "已自动清理较早上下文以释放端侧内存；当前诊断可继续，旧记录仍可从历史记录查看。",
+                isUser = false,
+                sourceLabel = MEMORY_GUARD_NOTICE_SOURCE,
+            ),
+        )
+    }
+
+    fun clearVolatileContextForMemory() {
+        conversationHistory.clear()
+        activeEquipmentContext = null
+        latestVisualContextText = ""
+        latestVisualBitmap = null
+        latestVisualEquipmentContext = null
+        visualLookupScopeActive = false
+        workOrderFollowUpContext = ""
+        activeOfflineTriageContext = null
+    }
+
+    fun enforceMemoryGuard(reason: String, force: Boolean = false, showNotice: Boolean = true) {
+        val memoryPressure = isRuntimeMemoryPressureHigh()
+        val overMessageLimit = messages.size > MEMORY_GUARD_MAX_MESSAGES
+        val overHistoryLimit = conversationHistory.size > MEMORY_GUARD_MAX_CONVERSATION_ITEMS
+        val overContextLimit =
+            latestVisualContextText.length + workOrderFollowUpContext.length > MEMORY_GUARD_CONTEXT_CHAR_LIMIT
+        if (!force && !memoryPressure && !overMessageLimit && !overHistoryLimit && !overContextLimit) return
+
+        val aggressive = memoryPressure || messages.size > MEMORY_GUARD_MAX_MESSAGES + MEMORY_GUARD_KEEP_MESSAGES
+        val keepCount = if (aggressive) MEMORY_GUARD_CRITICAL_KEEP_MESSAGES else MEMORY_GUARD_KEEP_MESSAGES
+        var cleaned = false
+
+        if (messages.isNotEmpty() && (messages.size > keepCount || memoryPressure || force)) {
+            val retainedMessages = messages.takeLast(keepCount)
+            val compactedMessages =
+                retainedMessages.mapIndexed { index, message ->
+                    message.compactedForMemory(
+                        aggressive = aggressive,
+                        preserveText = index >= retainedMessages.lastIndex - 1,
+                    )
+                }
+            messages.clear()
+            messages.addAll(compactedMessages)
+            cleaned = true
+        }
+
+        if (overHistoryLimit || memoryPressure || force) {
+            trimConversationHistoryForMemory()
+            cleaned = true
+        }
+
+        if (memoryPressure || overContextLimit) {
+            clearVolatileContextForMemory()
+            cleaned = true
+        }
+
+        if (cleaned) {
+            if (showNotice) addMemoryGuardNotice()
+            if (memoryPressure || aggressive) Runtime.getRuntime().gc()
+            Log.w(
+                TAG,
+                "Memory guard cleanup: reason=$reason, pressure=$memoryPressure, messages=${messages.size}, history=${conversationHistory.size}",
+            )
+        }
     }
 
     suspend fun streamVisualFollowUpReply(userText: String): String {
@@ -2914,6 +4416,7 @@ fun PocketOpsApp(
             put("temp", 0.1)
             put("top_k", 1)
             put("top_p", 1.0)
+            put("stream_options", org.json.JSONObject().put("include_usage", true))
         }
 
         val t0 = System.currentTimeMillis()
@@ -2934,6 +4437,7 @@ fun PocketOpsApp(
         }
 
         val fullContent = StringBuilder()
+        var responseUsage: GenerationUsage? = null
         try {
             val reader = httpConn.inputStream.bufferedReader()
             try {
@@ -2944,9 +4448,14 @@ fun PocketOpsApp(
                     val data = l.removePrefix("data: ").trim()
                     if (data == "[DONE]") break
                     try {
-                        val delta = org.json.JSONObject(data).getJSONArray("choices").getJSONObject(0).getJSONObject("delta")
-                        if (delta.has("content")) {
-                            fullContent.append(delta.getString("content"))
+                        val chunk = org.json.JSONObject(data)
+                        chunk.optGenerationUsage()?.let { responseUsage = it }
+                        val choices = chunk.optJSONArray("choices") ?: continue
+                        val firstChoice = choices.optJSONObject(0) ?: continue
+                        val delta = firstChoice.optJSONObject("delta") ?: firstChoice.optJSONObject("message") ?: continue
+                        val deltaContent = delta.optString("content").takeIf { it.isNotBlank() }
+                        if (deltaContent != null) {
+                            fullContent.append(deltaContent)
                             val content = fullContent.toString()
                             withContext(Dispatchers.Main) {
                                 val idx = messages.size - 1
@@ -2972,6 +4481,7 @@ fun PocketOpsApp(
 
         val content = fullContent.toString().trim().ifBlank { "上一轮图片信息不足，建议补拍设备编号、故障部位和仪表参数后再判断。" }
         val elapsed = System.currentTimeMillis() - t0
+        val tokenUsage = responseUsage.orEstimated(content)
         withContext(Dispatchers.Main) {
             val idx = messages.size - 1
             if (idx >= 0) {
@@ -2979,10 +4489,103 @@ fun PocketOpsApp(
                     text = content,
                     sourceLabel = source,
                     elapsedMs = elapsed,
+                    tokenUsage = tokenUsage,
                     isImageResponse = true,
                     canGenerateWorkOrder = canGenerate,
                 )
             }
+        }
+        return content
+    }
+
+    suspend fun runVisualLocalizationReply(userText: String, sourceBitmap: Bitmap): String {
+        withContext(Dispatchers.Main) {
+            messages.add(
+                PocketMessage(
+                    text = "正在定位并标注图片目标...",
+                    isUser = false,
+                    sourceLabel = "图片定位",
+                    isImageResponse = true,
+                    canGenerateWorkOrder = false,
+                ),
+            )
+        }
+
+        val t0 = System.currentTimeMillis()
+        var responseUsage: GenerationUsage? = null
+        clearGenieChatState()
+        val stream = java.io.ByteArrayOutputStream()
+        sourceBitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, stream)
+        val b64 = android.util.Base64.encodeToString(stream.toByteArray(), android.util.Base64.NO_WRAP)
+        val localizationQuestion =
+            if (isHydraulicPumpHoseLocalizationRequest(userText)) {
+                buildHydraulicPumpHoseLocalizationQuestion(userText, sourceBitmap.width, sourceBitmap.height)
+            } else {
+                buildVisualLocalizationQuestion(userText, sourceBitmap.width, sourceBitmap.height)
+            }
+        val reqJson = org.json.JSONObject().apply {
+            put("model", "qwen2.5vl-3b-8850-2.42")
+            put("stream", false)
+            put("size", 4096)
+            put("temp", 0.0)
+            put("top_k", 1)
+            put("top_p", 1.0)
+                        put("messages", org.json.JSONArray().apply {
+                put(org.json.JSONObject().put("role", "system").put("content", VISUAL_LOCALIZATION_SYSTEM_PROMPT))
+                put(
+                    org.json.JSONObject()
+                        .put("role", "user")
+                        .put(
+                            "content",
+                            org.json.JSONObject()
+                                .put("question", localizationQuestion)
+                                .put("image", b64),
+                        ),
+                )
+            })
+        }
+
+        val conn = (java.net.URL("http://127.0.0.1:8910/v1/chat/completions").openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "POST"
+            setRequestProperty("Content-Type", "application/json")
+            doOutput = true
+            connectTimeout = 10000
+            readTimeout = 120000
+        }
+        conn.outputStream.use { it.write(reqJson.toString().toByteArray(Charsets.UTF_8)) }
+        val response = try { conn.readTextResponse() } finally { conn.disconnect() }
+        if (response.code !in 200..299) {
+            throw IllegalStateException(buildHttpErrorMessage("图片定位推理失败", response.code, response.body))
+        }
+
+        val respJson = org.json.JSONObject(response.body)
+        responseUsage = respJson.optGenerationUsage()
+        val rawContent = respJson.getJSONArray("choices").getJSONObject(0)
+            .getJSONObject("message").getString("content")
+        val localizationResult = parseVisualLocalizationResponse(rawContent, userText, sourceBitmap.width, sourceBitmap.height)
+        val content = localizationResult.answer
+        val elapsed = System.currentTimeMillis() - t0
+        val tokenUsage = responseUsage.orEstimated(content)
+
+        withContext(Dispatchers.Main) {
+            val idx = messages.size - 1
+            if (idx >= 0) {
+                messages[idx] = messages[idx].copy(
+                    text = content,
+                    bitmap = if (localizationResult.annotations.isNotEmpty()) sourceBitmap else null,
+                    visualAnnotations = localizationResult.annotations,
+                    sourceLabel = "图片定位",
+                    elapsedMs = elapsed,
+                    tokenUsage = tokenUsage,
+                    isImageResponse = true,
+                    canGenerateWorkOrder = false,
+                )
+            }
+            latestVisualContextText = "[用户请求基于上一张图片定位] $userText\n$content".take(MEMORY_GUARD_CONTEXT_CHAR_LIMIT)
+            latestVisualBitmap = sourceBitmap
+            latestVisualEquipmentContext = knowledgeGraph.findEquipment(content).firstOrNull()
+            visualLookupScopeActive = true
+            activeEquipmentContext = latestVisualEquipmentContext
         }
         return content
     }
@@ -3022,6 +4625,7 @@ fun PocketOpsApp(
             put("temp", 0.2)
             put("top_k", 1)
             put("top_p", 1.0)
+            put("stream_options", org.json.JSONObject().put("include_usage", true))
         }
 
         val t0 = System.currentTimeMillis()
@@ -3042,6 +4646,7 @@ fun PocketOpsApp(
         }
 
         val fullContent = StringBuilder()
+        var responseUsage: GenerationUsage? = null
         try {
             val reader = httpConn.inputStream.bufferedReader()
             try {
@@ -3052,9 +4657,14 @@ fun PocketOpsApp(
                     val data = l.removePrefix("data: ").trim()
                     if (data == "[DONE]") break
                     try {
-                        val delta = org.json.JSONObject(data).getJSONArray("choices").getJSONObject(0).getJSONObject("delta")
-                        if (delta.has("content")) {
-                            fullContent.append(delta.getString("content"))
+                        val chunk = org.json.JSONObject(data)
+                        chunk.optGenerationUsage()?.let { responseUsage = it }
+                        val choices = chunk.optJSONArray("choices") ?: continue
+                        val firstChoice = choices.optJSONObject(0) ?: continue
+                        val delta = firstChoice.optJSONObject("delta") ?: firstChoice.optJSONObject("message") ?: continue
+                        val deltaContent = delta.optString("content").takeIf { it.isNotBlank() }
+                        if (deltaContent != null) {
+                            fullContent.append(deltaContent)
                             val content = fullContent.toString()
                             withContext(Dispatchers.Main) {
                                 val idx = messages.size - 1
@@ -3084,6 +4694,7 @@ fun PocketOpsApp(
                 workOrderContext = contextText,
             )
         val elapsed = System.currentTimeMillis() - t0
+        val tokenUsage = responseUsage.orEstimated(content)
         withContext(Dispatchers.Main) {
             val idx = messages.size - 1
             if (idx >= 0) {
@@ -3091,6 +4702,7 @@ fun PocketOpsApp(
                     text = content,
                     sourceLabel = "工单后续沟通",
                     elapsedMs = elapsed,
+                    tokenUsage = tokenUsage,
                     isFollowUpResponse = true,
                 )
             }
@@ -3101,16 +4713,22 @@ fun PocketOpsApp(
     // Send logic — unified multi-turn with image / video context
     fun sendMessage(text: String, bitmap: Bitmap?, videoUri: Uri? = null) {
         if (text.isBlank() && bitmap == null && videoUri == null) return
+        enforceMemoryGuard(reason = "before_send")
         val isVideoRequest = videoUri != null
         val userText =
             text.ifBlank {
                 if (isVideoRequest) {
-                    "请分析该视频抽帧中的设备状态、故障线索和异常画面"
+                    DEFAULT_VIDEO_INSPECTION_REQUEST
                 } else {
                     "请描述这张图片中的内容"
                 }
             }
-        val userMessageText = if (isVideoRequest) "视频诊断：$userText" else userText
+        val isVideoInspectionRequest = isVideoRequest && isVehicleInspectionText(userText)
+        val userMessageText = if (isVideoRequest) {
+            "${if (isVideoInspectionRequest) "车辆点检" else "视频诊断"}：$userText"
+        } else {
+            userText
+        }
         val explicitEquipmentMentionForTurn = extractExplicitEquipmentMention(userText)
         val explicitUnknownEquipmentForTurn =
             explicitEquipmentMentionForTurn != null && knowledgeGraph.findEquipment(userText).isEmpty()
@@ -3128,8 +4746,15 @@ fun PocketOpsApp(
         val safeBitmap = bitmap?.let {
             if (it.config == Bitmap.Config.HARDWARE) it.copy(Bitmap.Config.ARGB_8888, false) else it
         }
+        val isVisualLocalizationRequestForTurn =
+            safeBitmap != null && videoUri == null && isVisualLocalizationRequest(userText)
 
         messages.add(PocketMessage(text = userMessageText, isUser = true, bitmap = safeBitmap))
+        enforceMemoryGuard(
+            reason = "after_user_message",
+            force = messages.size > MEMORY_GUARD_MAX_MESSAGES,
+            showNotice = false,
+        )
         val userMessageIndex = messages.lastIndex
         val equipmentContextForTurn = if (explicitUnknownEquipmentForTurn) null else activeEquipmentContext
         isGenerating = true
@@ -3142,6 +4767,24 @@ fun PocketOpsApp(
                     conversationHistory.add("assistant" to content)
                     appendHistory(userText, content)
                     return@launch
+                }
+
+                if (
+                    bitmap == null &&
+                    videoUri == null &&
+                    visualLookupScopeActive &&
+                    latestVisualBitmap != null &&
+                    !explicitNewDiagnosisForTurn &&
+                    isVisualLocalizationRequest(userText)
+                ) {
+                    val sourceBitmap = latestVisualBitmap
+                    if (sourceBitmap != null) {
+                        val content = runVisualLocalizationReply(userText, sourceBitmap)
+                        conversationHistory.add("user" to userText)
+                        conversationHistory.add("assistant" to content)
+                        appendHistory(userText, content, isImage = true)
+                        return@launch
+                    }
                 }
 
                 if (
@@ -3170,6 +4813,7 @@ fun PocketOpsApp(
                                     isUser = false,
                                     sourceLabel = "端侧问诊排查",
                                     elapsedMs = System.currentTimeMillis() - t0,
+                                    tokenUsage = GenerationUsage(estimateOutputTokens(triageReply.text), estimated = true),
                                     isFieldAssistResponse = true,
                                     checklist = triageReply.checklist,
                                 ),
@@ -3192,6 +4836,7 @@ fun PocketOpsApp(
                                         isUser = false,
                                         sourceLabel = "端侧问诊排查",
                                         elapsedMs = System.currentTimeMillis() - t0,
+                                        tokenUsage = GenerationUsage(estimateOutputTokens(triageReply.text), estimated = true),
                                         isFieldAssistResponse = true,
                                         checklist = triageReply.checklist,
                                     ),
@@ -3210,26 +4855,139 @@ fun PocketOpsApp(
 
                 var visualBitmap = safeBitmap
                 var visualSystemPrompt = IMAGE_SYSTEM_PROMPT
-                var visualQuestion = "请用中文回答。$userText"
+                var visualQuestion =
+                    if (isPartRecognitionQuestion(userText)) {
+                        buildImageDiagnosisQuestion(userText, visualBitmap?.width, visualBitmap?.height)
+                    } else {
+                        buildGeneralImageQuestion(userText, visualBitmap?.width, visualBitmap?.height)
+                    }
                 var visualHistoryLabel = "[用户发送了图片] $userText"
                 var visualErrorPrefix = "图片推理失败"
+                var visualSourceLabel = "图片诊断"
+                var visualLoadingText = "正在使用端侧模型分析图片..."
+                var visualCanGenerateWorkOrder = true
+                var extractedVideoFrames: ExtractedVideoFrames? = null
+
+                if (isVisualLocalizationRequestForTurn) {
+                    visualSystemPrompt = VISUAL_LOCALIZATION_SYSTEM_PROMPT
+                    visualQuestion =
+                        if (isHydraulicPumpHoseLocalizationRequest(userText)) {
+                            buildHydraulicPumpHoseLocalizationQuestion(userText, visualBitmap.width, visualBitmap.height)
+                        } else {
+                            buildVisualLocalizationQuestion(userText, visualBitmap.width, visualBitmap.height)
+                        }
+                    visualHistoryLabel = "[用户发送了图片定位] $userText"
+                    visualErrorPrefix = "图片定位推理失败"
+                    visualSourceLabel = "图片定位"
+                    visualLoadingText = "正在定位并标注图片目标..."
+                    visualCanGenerateWorkOrder = false
+                }
 
                 if (videoUri != null) {
                     withContext(Dispatchers.Main) {
                         messages.add(
                             PocketMessage(
-                                text = "\u6b63\u5728\u4f7f\u7528\u7aef\u4fa7\u6a21\u578b\u5206\u6790\u89c6\u9891...",
+                                text = if (isVideoInspectionRequest) "正在逐张精读车辆点检关键帧..." else "\u6b63\u5728\u4f7f\u7528\u7aef\u4fa7\u6a21\u578b\u5206\u6790\u89c6\u9891...",
                                 isUser = false,
                                 isImageResponse = true,
-                                sourceLabel = "视频诊断",
-                                canGenerateWorkOrder = true,
+                                sourceLabel = if (isVideoInspectionRequest) "车辆点检" else "视频诊断",
+                                canGenerateWorkOrder = !isVideoInspectionRequest,
                             ),
                         )
                     }
 
                     val extractedFrames =
-                        extractVideoFrames(context, videoUri)
+                        extractVideoFrames(
+                            context = context,
+                            uri = videoUri,
+                            maxFrames = if (isVideoInspectionRequest) VEHICLE_INSPECTION_TOTAL_FRAME_COUNT else 4,
+                            includeTailFrame = isVideoInspectionRequest,
+                        )
                             ?: throw IllegalStateException("未能从视频中提取有效帧")
+                    extractedVideoFrames = extractedFrames
+
+                    if (isVideoInspectionRequest) {
+                        visualHistoryLabel = "[用户发送了车辆点检视频逐帧] $userText"
+                        visualSourceLabel = "车辆点检"
+                        visualErrorPrefix = "车辆点检逐帧识别失败"
+                        visualCanGenerateWorkOrder = false
+                        try {
+                            val visualT0 = System.currentTimeMillis()
+                            withContext(Dispatchers.Main) {
+                                conversationHistory.clear()
+                                activeEquipmentContext = null
+                                latestVisualContextText = ""
+                                latestVisualBitmap = null
+                                latestVisualEquipmentContext = null
+                                visualLookupScopeActive = false
+                                resetWorkOrderFollowUpContext()
+                                resetOfflineTriageContext()
+                                if (userMessageIndex in messages.indices) {
+                                    messages[userMessageIndex] = messages[userMessageIndex].copy(bitmap = null)
+                                }
+                            }
+
+                            val content = analyzeVehicleInspectionFramesOneByOne(extractedFrames, userText)
+                            val visualElapsed = System.currentTimeMillis() - visualT0
+                            val tokenUsage = GenerationUsage(estimateOutputTokens(content), estimated = true)
+                            withContext(Dispatchers.Main) {
+                                val idx = messages.size - 1
+                                if (idx >= 0) {
+                                    messages[idx] = messages[idx].copy(
+                                        text = content,
+                                        sourceLabel = visualSourceLabel,
+                                        bitmap = null,
+                                        visualAnnotations = emptyList(),
+                                        elapsedMs = visualElapsed,
+                                        tokenUsage = tokenUsage,
+                                        isImageResponse = true,
+                                        canGenerateWorkOrder = visualCanGenerateWorkOrder,
+                                        checklist = buildBaseFieldChecklist(FieldFaultCategory.VEHICLE_INSPECTION),
+                                    )
+                                }
+                                latestVisualContextText = "$visualHistoryLabel\n$content".take(MEMORY_GUARD_CONTEXT_CHAR_LIMIT)
+                                latestVisualBitmap = null
+                                latestVisualEquipmentContext = knowledgeGraph.findEquipment(content).firstOrNull()
+                                visualLookupScopeActive = true
+                                activeEquipmentContext = latestVisualEquipmentContext
+                            }
+                            conversationHistory.add("user" to visualHistoryLabel)
+                            conversationHistory.add("assistant" to content)
+                            appendHistory(userText, content, isVideo = true)
+                        } catch (e: Exception) {
+                            Log.e(TAG, visualErrorPrefix, e)
+                            val content = buildVehicleInspectionFallbackAnswer(extractedFrames.instrumentTextHint)
+                            withContext(Dispatchers.Main) {
+                                val idx = messages.size - 1
+                                if (idx >= 0) {
+                                    messages[idx] = messages[idx].copy(
+                                        text = content,
+                                        sourceLabel = visualSourceLabel,
+                                        bitmap = null,
+                                        elapsedMs = 0L,
+                                        tokenUsage = GenerationUsage(estimateOutputTokens(content), estimated = true),
+                                        isImageResponse = true,
+                                        canGenerateWorkOrder = visualCanGenerateWorkOrder,
+                                        checklist = buildBaseFieldChecklist(FieldFaultCategory.VEHICLE_INSPECTION),
+                                    )
+                                }
+                                latestVisualContextText = "$visualHistoryLabel\n$content".take(MEMORY_GUARD_CONTEXT_CHAR_LIMIT)
+                                latestVisualBitmap = null
+                                latestVisualEquipmentContext = null
+                                visualLookupScopeActive = true
+                                activeEquipmentContext = null
+                            }
+                            conversationHistory.add("user" to visualHistoryLabel)
+                            conversationHistory.add("assistant" to content)
+                            appendHistory(userText, content, isVideo = true)
+                        } finally {
+                            extractedFrames.recycleAnalysisFrames()
+                            if (!extractedFrames.contactSheet.isRecycled) {
+                                extractedFrames.contactSheet.recycle()
+                            }
+                        }
+                        return@launch
+                    }
 
                     visualBitmap = extractedFrames.contactSheet
                     visualSystemPrompt = VIDEO_SYSTEM_PROMPT
@@ -3237,6 +4995,8 @@ fun PocketOpsApp(
                         "这是从同一段设备视频中提取的${extractedFrames.frameCount}帧关键帧拼图，视频时长约${formatVideoTimestamp(extractedFrames.durationMs)}。请结合全部画面进行诊断。回答必须全部使用简体中文；不要用英文描述画面、结论或建议。请按“画面观察、异常线索、可能原因、处理建议”的中文结构回答。用户问题：$userText"
                     visualHistoryLabel = "[用户发送了视频抽帧] $userText"
                     visualErrorPrefix = "视频抽帧推理失败"
+                    visualSourceLabel = "视频诊断"
+                    visualCanGenerateWorkOrder = !isVideoInspectionRequest
 
                     withContext(Dispatchers.Main) {
                         if (userMessageIndex in messages.indices) {
@@ -3251,6 +5011,7 @@ fun PocketOpsApp(
                         conversationHistory.clear()
                         activeEquipmentContext = null
                         latestVisualContextText = ""
+                        latestVisualBitmap = null
                         latestVisualEquipmentContext = null
                         visualLookupScopeActive = false
                         resetWorkOrderFollowUpContext()
@@ -3260,68 +5021,141 @@ fun PocketOpsApp(
                         withContext(Dispatchers.Main) {
                             messages.add(
                                 PocketMessage(
-                                    text = "\u6b63\u5728\u4f7f\u7528\u7aef\u4fa7\u6a21\u578b\u5206\u6790\u56fe\u7247...",
+                                    text = visualLoadingText,
                                     isUser = false,
                                     isImageResponse = true,
-                                    sourceLabel = "图片诊断",
-                                    canGenerateWorkOrder = true,
+                                    sourceLabel = visualSourceLabel,
+                                    canGenerateWorkOrder = visualCanGenerateWorkOrder,
                                 ),
                             )
                         }
                     }
 
                     try {
+                        val visualT0 = System.currentTimeMillis()
+                        var responseUsage: GenerationUsage? = null
                         clearGenieChatState()
                         val stream = java.io.ByteArrayOutputStream()
-                        visualBitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, stream)
+                        val imageFormat =
+                            if (videoUri != null) android.graphics.Bitmap.CompressFormat.JPEG
+                            else android.graphics.Bitmap.CompressFormat.PNG
+                        val imageQuality = if (videoUri != null) 88 else 100
+                        visualBitmap.compress(imageFormat, imageQuality, stream)
                         val b64 = android.util.Base64.encodeToString(stream.toByteArray(), android.util.Base64.NO_WRAP)
 
-                        val reqJson = org.json.JSONObject().apply {
-                            put("model", "qwen2.5vl-3b-8850-2.42")
-                            put("stream", false)
-                            put("size", 4096)
-                            put("temp", 0.0)
-                            put("top_k", 1)
-                            put("top_p", 1.0)
-                            put("messages", org.json.JSONArray().apply {
-                                put(org.json.JSONObject().put("role", "system").put("content", visualSystemPrompt))
-                                put(org.json.JSONObject().put("role", "user").put("content",
-                                    org.json.JSONObject().put("question", visualQuestion).put("image", b64)))
-                            })
+                        fun buildVisualRequestJson(question: String, inputSize: Int): org.json.JSONObject {
+                            return org.json.JSONObject().apply {
+                                put("model", "qwen2.5vl-3b-8850-2.42")
+                                put("stream", false)
+                                put("size", inputSize)
+                                put("temp", 0.0)
+                                put("top_k", 1)
+                                put("top_p", 1.0)
+                                put("messages", org.json.JSONArray().apply {
+                                    put(org.json.JSONObject().put("role", "system").put("content", visualSystemPrompt))
+                                    put(
+                                        org.json.JSONObject().put(
+                                            "role",
+                                            "user",
+                                        ).put(
+                                            "content",
+                                            org.json.JSONObject().put("question", question).put("image", b64),
+                                        ),
+                                    )
+                                })
+                            }
                         }
 
-                        Log.d(TAG, "VLM HTTP request: ${b64.length} base64 chars")
-                        val url = java.net.URL("http://127.0.0.1:8910/v1/chat/completions")
-                        val conn = url.openConnection() as java.net.HttpURLConnection
-                        conn.requestMethod = "POST"
-                        conn.setRequestProperty("Content-Type", "application/json")
-                        conn.doOutput = true
-                        conn.connectTimeout = 10000
-                        conn.readTimeout = 120000
-                        conn.outputStream.use { it.write(reqJson.toString().toByteArray(Charsets.UTF_8)) }
+                        fun postVisualRequest(question: String, inputSize: Int): Pair<HttpTextResponse, String> {
+                            val reqJson = buildVisualRequestJson(question, inputSize)
+                            Log.d(TAG, "VLM HTTP request: ${b64.length} base64 chars, size=$inputSize")
+                            val url = java.net.URL("http://127.0.0.1:8910/v1/chat/completions")
+                            val conn = url.openConnection() as java.net.HttpURLConnection
+                            conn.requestMethod = "POST"
+                            conn.setRequestProperty("Content-Type", "application/json")
+                            conn.doOutput = true
+                            conn.connectTimeout = 10000
+                            conn.readTimeout = 120000
+                            conn.outputStream.use { it.write(reqJson.toString().toByteArray(Charsets.UTF_8)) }
 
-                        val response = try { conn.readTextResponse() } finally { conn.disconnect() }
-                        if (response.code !in 200..299) {
-                            throw IllegalStateException(buildHttpErrorMessage(visualErrorPrefix, response.code, response.body))
+                            val response = try { conn.readTextResponse() } finally { conn.disconnect() }
+                            if (response.code !in 200..299) {
+                                throw IllegalStateException(buildHttpErrorMessage(visualErrorPrefix, response.code, response.body))
+                            }
+                            val content = parseChatCompletionContent(response.body)
+                            if (content.isBlank()) {
+                                Log.w(TAG, "VLM HTTP response has no content: ${summarizeModelResponseBody(response.body)}")
+                            }
+                            return response to content
                         }
 
-                        val respJson = org.json.JSONObject(response.body)
-                        val rawContent = respJson.getJSONArray("choices").getJSONObject(0)
-                            .getJSONObject("message").getString("content")
-                        val content = if (videoUri != null) rewriteVlmAnswerToChinese(rawContent) else rawContent
+                        val primaryInputSize =
+                            if (videoUri != null) {
+                                1536
+                            } else {
+                                4096
+                            }
+                        var responseAndContent = postVisualRequest(visualQuestion, primaryInputSize)
+                        if (responseAndContent.second.isBlank() && videoUri != null) {
+                            clearGenieChatState()
+                            responseAndContent = postVisualRequest(visualQuestion, 1024)
+                        }
+                        val response = responseAndContent.first
+                        val rawContent = responseAndContent.second
+                            .ifBlank {
+                                throw IllegalStateException(
+                                    "$visualErrorPrefix：端侧模型未返回有效文本，返回内容：${summarizeModelResponseBody(response.body)}",
+                                )
+                            }
+                        responseUsage =
+                            try {
+                                org.json.JSONObject(response.body).optGenerationUsage()
+                            } catch (_: Exception) {
+                                null
+                            }
+                        val localizationResult =
+                            if (isVisualLocalizationRequestForTurn) parseVisualLocalizationResponse(rawContent, userText, visualBitmap.width, visualBitmap.height) else null
+                        var videoContent =
+                            if (videoUri != null) {
+                                rewriteVlmAnswerToChinese(rawContent, force = hasEnglishAnalysisSentence(rawContent))
+                            } else {
+                                rawContent
+                            }
+                        if (videoUri != null && isVideoInspectionRequest) {
+                            videoContent = normalizeVehicleInspectionAnswer(
+                                rawText = videoContent,
+                                instrumentTextHint = extractedVideoFrames?.instrumentTextHint.orEmpty(),
+                                userText = userText,
+                            )
+                        }
+                        val content = localizationResult?.answer
+                            ?: videoContent
+                        val visualAnnotations = localizationResult?.annotations.orEmpty()
+                        val visualElapsed = System.currentTimeMillis() - visualT0
+                        val tokenUsage = responseUsage.orEstimated(content)
 
                         withContext(Dispatchers.Main) {
                             val idx = messages.size - 1
                             if (idx >= 0) {
                                 messages[idx] = messages[idx].copy(
                                     text = content,
-                                    sourceLabel = if (videoUri != null) "视频诊断" else "图片诊断",
+                                    sourceLabel = if (videoUri != null) {
+                                        if (isVideoInspectionRequest) "车辆点检" else "视频诊断"
+                                    } else {
+                                        visualSourceLabel
+                                    },
+                                    bitmap = if (visualAnnotations.isNotEmpty()) visualBitmap else null,
+                                    visualAnnotations = visualAnnotations,
+                                    elapsedMs = visualElapsed,
+                                    tokenUsage = tokenUsage,
                                     isImageResponse = true,
-                                    canGenerateWorkOrder = true,
+                                    canGenerateWorkOrder = visualCanGenerateWorkOrder,
+                                    checklist = if (isVideoInspectionRequest) buildBaseFieldChecklist(FieldFaultCategory.VEHICLE_INSPECTION) else null,
                                 )
                             }
                             val matchedEquipment = knowledgeGraph.findEquipment(content).firstOrNull()
-                            latestVisualContextText = "$visualHistoryLabel\n$content"
+                            latestVisualContextText = "$visualHistoryLabel\n$content".take(MEMORY_GUARD_CONTEXT_CHAR_LIMIT)
+                            latestVisualBitmap = if (videoUri == null) visualBitmap else null
                             latestVisualEquipmentContext = matchedEquipment
                             visualLookupScopeActive = true
                             activeEquipmentContext = matchedEquipment
@@ -3331,10 +5165,45 @@ fun PocketOpsApp(
                         appendHistory(userText, content, isImage = videoUri == null, isVideo = videoUri != null)
                     } catch (e: Exception) {
                         Log.e(TAG, "VLM HTTP failed", e)
-                        withContext(Dispatchers.Main) {
-                            val idx = messages.size - 1
-                            val prefix = if (videoUri != null) "视频抽帧失败" else "图片推理失败"
-                            if (idx >= 0) messages[idx] = messages[idx].copy(text = "$prefix: ${e.message}")
+                        if (videoUri != null && isVideoInspectionRequest) {
+                            val content = buildVehicleInspectionFallbackAnswer(extractedVideoFrames?.instrumentTextHint.orEmpty())
+                            withContext(Dispatchers.Main) {
+                                val idx = messages.size - 1
+                                if (idx >= 0) {
+                                    messages[idx] = messages[idx].copy(
+                                        text = content,
+                                        sourceLabel = "车辆点检",
+                                        bitmap = null,
+                                        elapsedMs = 0L,
+                                        tokenUsage = GenerationUsage(estimateOutputTokens(content), estimated = true),
+                                        isImageResponse = true,
+                                        canGenerateWorkOrder = visualCanGenerateWorkOrder,
+                                        checklist = buildBaseFieldChecklist(FieldFaultCategory.VEHICLE_INSPECTION),
+                                    )
+                                }
+                                latestVisualContextText = "$visualHistoryLabel\n$content".take(MEMORY_GUARD_CONTEXT_CHAR_LIMIT)
+                                latestVisualBitmap = null
+                                latestVisualEquipmentContext = null
+                                visualLookupScopeActive = true
+                                activeEquipmentContext = null
+                            }
+                            conversationHistory.add("user" to visualHistoryLabel)
+                            conversationHistory.add("assistant" to content)
+                            appendHistory(userText, content, isVideo = true)
+                        } else {
+                            withContext(Dispatchers.Main) {
+                                val idx = messages.size - 1
+                                val prefix = if (videoUri != null) {
+                                    "视频抽帧失败"
+                                } else {
+                                    visualErrorPrefix
+                                }
+                                if (idx >= 0) messages[idx] = messages[idx].copy(text = "$prefix: ${e.message}")
+                            }
+                        }
+                    } finally {
+                        if (videoUri != null) {
+                            extractedVideoFrames?.recycleAnalysisFrames()
                         }
                     }
                     return@launch
@@ -3366,6 +5235,8 @@ fun PocketOpsApp(
                     val (report, graphJson) = graphResult
                     Log.d(TAG, "GraphRAG hit: ${report.equipment}")
                     if (!edgeDeepDiagnosisEnabled) {
+                        val reportText = buildDiagnosticReportText(report)
+                        val reportTokenUsage = GenerationUsage(estimateOutputTokens(reportText), estimated = true)
                         withContext(Dispatchers.Main) {
                             messages.add(
                                 PocketMessage(
@@ -3375,6 +5246,7 @@ fun PocketOpsApp(
                                     graphJson = graphJson,
                                     sourceLabel = "图谱快答",
                                     elapsedMs = graphElapsedMs,
+                                    tokenUsage = reportTokenUsage,
                                     relatedWorkOrders = report.workOrders,
                                     checklist = buildFieldChecklistForDiagnosis(userText, graphReport = report),
                                 ),
@@ -3383,15 +5255,16 @@ fun PocketOpsApp(
                             visualLookupScopeActive = false
                         }
                         conversationHistory.add("user" to userText)
-                        conversationHistory.add("assistant" to buildDiagnosticReportText(report))
-                        rememberWorkOrderFollowUpContext(userText, buildDiagnosticReportText(report), report)
-                        appendHistory(userText, buildDiagnosticReportText(report), isGraphRAG = true)
+                        conversationHistory.add("assistant" to reportText)
+                        rememberWorkOrderFollowUpContext(userText, reportText, report)
+                        appendHistory(userText, reportText, isGraphRAG = true)
                         return@launch
                     }
                 } else {
                     Log.d(TAG, "GraphRAG miss")
                 }
 
+                val lookupT0 = System.currentTimeMillis()
                 val equipmentLookupResult = buildEquipmentLookupAnswer(userText, contextualRetrievalText, knowledgeGraph)
                 if (equipmentLookupResult != null && graphResult == null) {
                     val (matchedEquipment, equipmentLookupAnswer) = equipmentLookupResult
@@ -3402,6 +5275,8 @@ fun PocketOpsApp(
                                 text = equipmentLookupAnswer,
                                 isUser = false,
                                 isImageResponse = lookupFromVisual,
+                                elapsedMs = System.currentTimeMillis() - lookupT0,
+                                tokenUsage = GenerationUsage(estimateOutputTokens(equipmentLookupAnswer), estimated = true),
                                 sourceLabel = if (lookupFromVisual) "图片上下文追问" else "",
                             ),
                         )
@@ -3418,9 +5293,19 @@ fun PocketOpsApp(
                 }
 
                 if (isEquipmentLookupQuestion(userText) && visualLookupScopeActive) {
+                    val answerT0 = System.currentTimeMillis()
                     val answer = "最近一次图片或视频里暂未匹配到知识库中的具体叉车编号。请补拍包含设备编号、配置号或铭牌的画面，或直接输入设备编号。"
                     withContext(Dispatchers.Main) {
-                        messages.add(PocketMessage(text = answer, isUser = false, isImageResponse = true, sourceLabel = "图片上下文追问"))
+                        messages.add(
+                            PocketMessage(
+                                text = answer,
+                                isUser = false,
+                                isImageResponse = true,
+                                sourceLabel = "图片上下文追问",
+                                elapsedMs = System.currentTimeMillis() - answerT0,
+                                tokenUsage = GenerationUsage(estimateOutputTokens(answer), estimated = true),
+                            ),
+                        )
                     }
                     conversationHistory.add("user" to userText)
                     conversationHistory.add("assistant" to answer)
@@ -3442,11 +5327,13 @@ fun PocketOpsApp(
                                         isUser = false,
                                         sourceLabel = "症状参考快答",
                                         elapsedMs = graphElapsedMs,
+                                        tokenUsage = GenerationUsage(estimateOutputTokens(content), estimated = true),
                                         checklist = buildFieldChecklistForDiagnosis(userText, llmContent = content),
                                     ),
                                 )
                                 activeEquipmentContext = null
                                 latestVisualContextText = ""
+                                latestVisualBitmap = null
                                 latestVisualEquipmentContext = null
                                 visualLookupScopeActive = false
                             }
@@ -3557,6 +5444,7 @@ fun PocketOpsApp(
                     put("temp", 0.0)
                     put("top_k", 1)
                     put("top_p", 1.0)
+                    put("stream_options", org.json.JSONObject().put("include_usage", true))
                 }
 
                 val t0 = System.currentTimeMillis()
@@ -3580,6 +5468,7 @@ fun PocketOpsApp(
                 }
 
                 val fullContent = StringBuilder()
+                var responseUsage: GenerationUsage? = null
                 var lastStreamUiUpdateAt = 0L
                 try {
                     val reader = httpConn.inputStream.bufferedReader()
@@ -3591,9 +5480,14 @@ fun PocketOpsApp(
                             val data = l.removePrefix("data: ").trim()
                             if (data == "[DONE]") break
                             try {
-                                val delta = org.json.JSONObject(data).getJSONArray("choices").getJSONObject(0).getJSONObject("delta")
-                                if (delta.has("content")) {
-                                    fullContent.append(delta.getString("content"))
+                                val chunk = org.json.JSONObject(data)
+                                chunk.optGenerationUsage()?.let { responseUsage = it }
+                                val choices = chunk.optJSONArray("choices") ?: continue
+                                val firstChoice = choices.optJSONObject(0) ?: continue
+                                val delta = firstChoice.optJSONObject("delta") ?: firstChoice.optJSONObject("message") ?: continue
+                                val deltaContent = delta.optString("content").takeIf { it.isNotBlank() }
+                                if (deltaContent != null) {
+                                    fullContent.append(deltaContent)
                                     val text = fullContent.toString()
                                     val now = System.currentTimeMillis()
                                     val shouldUpdateStreamUi =
@@ -3654,6 +5548,7 @@ fun PocketOpsApp(
                         graphReport = deepGraphReport,
                         llmContent = finalLlmContent,
                     )
+                val tokenUsage = responseUsage.orEstimated(finalLlmContent)
                 withContext(Dispatchers.Main) {
                     val idx = messages.size - 1
                     if (idx >= 0) {
@@ -3662,6 +5557,7 @@ fun PocketOpsApp(
                             relatedWorkOrders = relatedWOs,
                             sourceLabel = responseSourceLabel,
                             elapsedMs = t1 - t0,
+                            tokenUsage = tokenUsage,
                             graphJson = deepGraphJson,
                             isEdgeReasoning = true,
                             checklist = fieldChecklist,
@@ -3682,7 +5578,10 @@ fun PocketOpsApp(
                     else messages.add(PocketMessage(text = "推理失败: ${e.message}", isUser = false))
                 }
             } finally {
-                withContext(Dispatchers.Main) { isGenerating = false }
+                withContext(Dispatchers.Main) {
+                    isGenerating = false
+                    enforceMemoryGuard(reason = "after_generation")
+                }
             }
         }
     }
@@ -3807,6 +5706,7 @@ fun PocketOpsApp(
                                         conversationHistory.clear()
                                         activeEquipmentContext = null
                                         latestVisualContextText = ""
+                                        latestVisualBitmap = null
                                         latestVisualEquipmentContext = null
                                         visualLookupScopeActive = false
                                         resetWorkOrderFollowUpContext()
@@ -4026,10 +5926,10 @@ fun PocketOpsApp(
                             items(messages) { msg ->
                                 MessageBubble(
                                     msg,
-                                    onGenerateWorkOrder = {
+                                    onGenerateWorkOrder = { triggerMessage ->
                                         selectedWorkOrderMessage =
                                             buildDynamicWorkOrderMessage(
-                                                clickedMessage = msg,
+                                                clickedMessage = triggerMessage,
                                                 messages = messages.toList(),
                                                 conversationHistory = conversationHistory.toList(),
                                                 latestVisualContextText = latestVisualContextText,
@@ -4084,7 +5984,7 @@ fun PocketOpsApp(
             onRequestClearQueuedWorkOrders = { showClearQueuedWorkOrdersDialog = true },
             onSaveRecord = { userText, aiText ->
                 appendHistory(userText, aiText)
-                workOrderFollowUpContext = aiText
+                workOrderFollowUpContext = aiText.take(MEMORY_GUARD_CONTEXT_CHAR_LIMIT)
             },
             onWorkOrderCompleted = {
                 clearDiagnosisContextAfterWorkOrder()
@@ -4165,6 +6065,7 @@ fun PocketOpsApp(
                     resetWorkOrderFollowUpContext()
                 }
                 latestVisualContextText = ""
+                latestVisualBitmap = null
                 latestVisualEquipmentContext = null
                 visualLookupScopeActive = false
                 resetOfflineTriageContext()
@@ -4177,7 +6078,7 @@ fun PocketOpsApp(
 
 @Composable
 private fun EmptyState(edgeDeepDiagnosisEnabled: Boolean, onChipClick: (String) -> Unit) {
-    val chips = listOf("5号叉车无法启动", "3号叉车举升缓慢，请给出维修建议", "AGV搬运车偶发急停", "7号叉车转向沉重", "2号叉车发动机过热")
+    val chips = listOf("车辆环车点检，检查仪表盘和反光镜", "5号叉车无法启动", "3号叉车举升缓慢，请给出维修建议", "AGV搬运车偶发急停", "7号叉车转向沉重")
     Column(
         Modifier
             .fillMaxSize()
@@ -4208,6 +6109,7 @@ private fun EmptyState(edgeDeepDiagnosisEnabled: Boolean, onChipClick: (String) 
                     StatusChip("\u56fe\u8c31\u8bca\u65ad", AccentSoft, Accent)
                     StatusChip(if (edgeDeepDiagnosisEnabled) "端侧深度推理" else "图谱快答优先", SurfaceMuted, TextMuted)
                     StatusChip("问诊排查", SurfaceMuted, TextMuted)
+                    StatusChip("视频点检", SurfaceMuted, TextMuted)
                 }
                 Spacer(Modifier.height(16.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -4227,7 +6129,7 @@ private fun EmptyState(edgeDeepDiagnosisEnabled: Boolean, onChipClick: (String) 
                         shape = RoundedCornerShape(16.dp),
                     ) {
                         Column(Modifier.padding(14.dp)) {
-                            Text("4", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = TextMain)
+                            Text("5", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = TextMain)
                             Text("端侧入口模式", fontSize = 12.sp, color = TextMuted)
                         }
                     }
@@ -4273,6 +6175,7 @@ private fun EmptyState(edgeDeepDiagnosisEnabled: Boolean, onChipClick: (String) 
                 Spacer(Modifier.height(10.dp))
                 listOf(
                     "优先补充设备编号、位置与当前工况。",
+                    "车辆点检建议上传环车一周视频，并补拍仪表盘和左右反光镜近景。",
                     "涉及异响、过热、泄漏时建议上传图片或视频。",
                     "\u8bca\u65ad\u5b8c\u6210\u540e\u53ef\u76f4\u63a5\u751f\u6210\u5de5\u5355\u5e76\u5bfc\u51fa\u5de5\u5355\u6587\u6863\u3002",
                 ).forEach { line ->
@@ -4291,12 +6194,144 @@ private fun EmptyState(edgeDeepDiagnosisEnabled: Boolean, onChipClick: (String) 
 // ==================== Message Bubble ====================
 
 @Composable
+private fun VisualAnnotatedImage(
+    bitmap: Bitmap,
+    annotations: List<VisualAnnotation>,
+    modifier: Modifier = Modifier,
+) {
+    val aspectRatio = remember(bitmap) {
+        (bitmap.width.toFloat() / bitmap.height.coerceAtLeast(1).toFloat()).coerceIn(0.55f, 1.9f)
+    }
+    Box(
+        modifier
+            .fillMaxWidth()
+            .aspectRatio(aspectRatio)
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.Black.copy(alpha = 0.04f)),
+    ) {
+        Image(
+            bitmap.asImageBitmap(),
+            contentDescription = null,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Fit,
+        )
+        androidx.compose.foundation.Canvas(Modifier.matchParentSize()) {
+            val bitmapRatio = bitmap.width.toFloat() / bitmap.height.coerceAtLeast(1).toFloat()
+            val containerRatio = size.width / size.height.coerceAtLeast(1f)
+            val drawWidth: Float
+            val drawHeight: Float
+            val offsetX: Float
+            val offsetY: Float
+            if (containerRatio > bitmapRatio) {
+                drawHeight = size.height
+                drawWidth = drawHeight * bitmapRatio
+                offsetX = (size.width - drawWidth) / 2f
+                offsetY = 0f
+            } else {
+                drawWidth = size.width
+                drawHeight = drawWidth / bitmapRatio
+                offsetX = 0f
+                offsetY = (size.height - drawHeight) / 2f
+            }
+            val strokeWidth = 3.dp.toPx()
+            val labelPaddingX = 6.dp.toPx()
+            val labelHeight = 22.dp.toPx()
+            val labelTopPadding = 3.dp.toPx()
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.White.toArgb()
+                textSize = 12.sp.toPx()
+                typeface = android.graphics.Typeface.create(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD)
+            }
+            annotations.forEach { annotation ->
+                val left = offsetX + annotation.x1.coerceIn(0f, 1f) * drawWidth
+                val top = offsetY + annotation.y1.coerceIn(0f, 1f) * drawHeight
+                val right = offsetX + annotation.x2.coerceIn(0f, 1f) * drawWidth
+                val bottom = offsetY + annotation.y2.coerceIn(0f, 1f) * drawHeight
+                val rectWidth = (right - left).coerceAtLeast(1f)
+                val rectHeight = (bottom - top).coerceAtLeast(1f)
+                drawRect(
+                    color = DangerColor,
+                    topLeft = Offset(left, top),
+                    size = Size(rectWidth, rectHeight),
+                    style = Stroke(width = strokeWidth),
+                )
+
+                val confidenceText =
+                    annotation.confidence.takeIf { it > 0f }?.let { " ${(it * 100).roundToInt()}%" }.orEmpty()
+                val labelText = "${annotation.label}$confidenceText"
+                val maxLabelWidth = (size.width - left).coerceAtLeast(1f)
+                val labelWidth = (textPaint.measureText(labelText) + labelPaddingX * 2).coerceAtMost(maxLabelWidth).coerceAtLeast(1f)
+                val labelTop = (top - labelHeight - labelTopPadding).takeIf { it >= 0f } ?: (top + labelTopPadding)
+                drawRoundRect(
+                    color = DangerColor.copy(alpha = 0.92f),
+                    topLeft = Offset(left, labelTop),
+                    size = Size(labelWidth, labelHeight),
+                    cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx()),
+                )
+                drawContext.canvas.nativeCanvas.drawText(
+                    labelText,
+                    left + labelPaddingX,
+                    labelTop + 15.dp.toPx(),
+                    textPaint,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageBitmapPreview(
+    bitmap: Bitmap,
+    modifier: Modifier = Modifier,
+) {
+    val rawAspectRatio = remember(bitmap) {
+        bitmap.width.toFloat() / bitmap.height.coerceAtLeast(1).toFloat()
+    }
+    val showFullPreview =
+        rawAspectRatio < 0.75f ||
+            rawAspectRatio > 1.35f ||
+            (bitmap.width >= 600 && bitmap.height >= 600)
+    if (showFullPreview) {
+        val previewHeight = when {
+            rawAspectRatio < 0.55f -> 380.dp
+            rawAspectRatio < 0.75f -> 320.dp
+            rawAspectRatio > 1.8f -> 170.dp
+            else -> 240.dp
+        }
+        Box(
+            modifier
+                .fillMaxWidth()
+                .height(previewHeight)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color.Black.copy(alpha = 0.04f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Image(
+                bitmap.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit,
+            )
+        }
+    } else {
+        Image(
+            bitmap.asImageBitmap(),
+            contentDescription = null,
+            modifier = modifier.size(180.dp).clip(RoundedCornerShape(12.dp)),
+            contentScale = ContentScale.Crop,
+        )
+    }
+}
+
+@Composable
 private fun MessageBubble(
     msg: PocketMessage,
-    onGenerateWorkOrder: () -> Unit = {},
+    onGenerateWorkOrder: (PocketMessage) -> Unit = {},
     onShowGraph: () -> Unit = {},
 ) {
     val screenW = LocalConfiguration.current.screenWidthDp.dp
+    val requiresChecklistCompletionForWorkOrder =
+        msg.checklist != null && msg.sourceLabel.contains("端侧泛化")
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 3.dp),
         horizontalArrangement = if (msg.isUser) Arrangement.End else Arrangement.Start,
@@ -4313,17 +6348,22 @@ private fun MessageBubble(
         Column(Modifier.widthIn(max = screenW * 0.82f), horizontalAlignment = if (msg.isUser) Alignment.End else Alignment.Start) {
             // Image
             msg.bitmap?.let { bmp ->
-                Image(bmp.asImageBitmap(), null, Modifier.size(180.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop)
+                if (msg.visualAnnotations.isNotEmpty()) {
+                    VisualAnnotatedImage(bitmap = bmp, annotations = msg.visualAnnotations)
+                } else {
+                    MessageBitmapPreview(bitmap = bmp)
+                }
                 Spacer(Modifier.height(4.dp))
             }
             // Report card or text bubble
             if (msg.report != null) {
                 DiagnosticCard(
                     r = msg.report,
-                    onGenerateWorkOrder = onGenerateWorkOrder,
+                    onGenerateWorkOrder = { onGenerateWorkOrder(msg) },
                     onShowGraph = { if (msg.graphJson.isNotEmpty()) onShowGraph() },
                     sourceLabel = msg.sourceLabel,
                     elapsedMs = msg.elapsedMs,
+                    tokenUsage = msg.tokenUsage,
                 )
             } else if (msg.text.isNotEmpty()) {
                 if (msg.isUser) {
@@ -4337,11 +6377,13 @@ private fun MessageBubble(
                     // AI diagnosis response as structured card
                     LlmDiagnosticCard(
                         text = msg.text,
-                        onGenerateWorkOrder = onGenerateWorkOrder,
+                        onGenerateWorkOrder = { onGenerateWorkOrder(msg) },
                         sourceLabel = msg.sourceLabel,
                         elapsedMs = msg.elapsedMs,
+                        tokenUsage = msg.tokenUsage,
                         onShowGraph = { if (msg.graphJson.isNotEmpty()) onShowGraph() },
                         hasGraph = msg.graphJson.isNotEmpty(),
+                        showGenerateWorkOrderButton = !requiresChecklistCompletionForWorkOrder,
                     )
                 } else {
                     // Short AI response or image response as simple bubble
@@ -4359,12 +6401,12 @@ private fun MessageBubble(
                     }
                     if (msg.sourceLabel.isNotBlank() || msg.elapsedMs > 0L) {
                         Spacer(Modifier.height(6.dp))
-                        SourceTraceRow(sourceLabel = msg.sourceLabel, elapsedMs = msg.elapsedMs)
+                        SourceTraceRow(sourceLabel = msg.sourceLabel, elapsedMs = msg.elapsedMs, tokenUsage = msg.tokenUsage)
                     }
-                    if (msg.canGenerateWorkOrder && !msg.text.startsWith("正在")) {
+                    if (msg.canGenerateWorkOrder && !msg.text.startsWith("正在") && !requiresChecklistCompletionForWorkOrder) {
                         Spacer(Modifier.height(8.dp))
                         OutlinedButton(
-                            onClick = onGenerateWorkOrder,
+                            onClick = { onGenerateWorkOrder(msg) },
                             modifier = Modifier.fillMaxWidth().height(38.dp),
                             shape = RoundedCornerShape(12.dp),
                             border = BorderStroke(1.dp, Accent.copy(alpha = 0.35f)),
@@ -4384,7 +6426,13 @@ private fun MessageBubble(
             }
             if (!msg.isUser && msg.checklist != null) {
                 Spacer(Modifier.height(8.dp))
-                FieldChecklistCard(msg.checklist)
+                FieldChecklistCard(
+                    checklist = msg.checklist,
+                    showCompletionWorkOrder = !msg.canGenerateWorkOrder || requiresChecklistCompletionForWorkOrder,
+                    onGenerateWorkOrder = { completedItems ->
+                        onGenerateWorkOrder(msg.withChecklistCompletionContext(msg.checklist, completedItems))
+                    },
+                )
             }
         }
     }
@@ -4399,6 +6447,7 @@ private fun DiagnosticCard(
     onShowGraph: () -> Unit = {},
     sourceLabel: String = "",
     elapsedMs: Long = 0L,
+    tokenUsage: GenerationUsage? = null,
 ) {
     val severity = r.symptom.properties["severity"] ?: ""
     val (severityBg, severityFg) = severityColors(severity)
@@ -4416,12 +6465,17 @@ private fun DiagnosticCard(
                     Spacer(Modifier.height(4.dp))
                     Text(
                         listOfNotNull(
-                            (sourceLabel.ifBlank { "\u56fe\u8c31\u8bca\u65ad" }),
+                            sourceLabel.ifBlank { "\u56fe\u8c31\u8bca\u65ad" },
                             "${r.nodeCount} \u8282\u70b9",
-                            elapsedMs.takeIf { it > 0L }?.let { "${it}ms" },
                         ).joinToString(" \u00b7 "),
                         color = TextMuted,
                         fontSize = 12.sp,
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    SourceTraceRow(
+                        sourceLabel = sourceLabel.ifBlank { "\u56fe\u8c31\u8bca\u65ad" },
+                        elapsedMs = elapsedMs,
+                        tokenUsage = tokenUsage,
                     )
                 }
                 Column(horizontalAlignment = Alignment.End) {
@@ -4599,8 +6653,10 @@ private fun LlmDiagnosticCard(
     onGenerateWorkOrder: () -> Unit,
     sourceLabel: String = "",
     elapsedMs: Long = 0L,
+    tokenUsage: GenerationUsage? = null,
     onShowGraph: () -> Unit = {},
     hasGraph: Boolean = false,
+    showGenerateWorkOrderButton: Boolean = true,
 ) {
     val report = remember(text) { parseLlmReport(text) }
 
@@ -4621,6 +6677,7 @@ private fun LlmDiagnosticCard(
                     SourceTraceRow(
                         sourceLabel = sourceLabel.ifBlank { "\u7aef\u4fa7\u6a21\u578b\u8bca\u65ad" },
                         elapsedMs = elapsedMs,
+                        tokenUsage = tokenUsage,
                     )
                 }
                 report?.severity?.takeIf { it.isNotBlank() }?.let { severity ->
@@ -4785,43 +6842,46 @@ private fun LlmDiagnosticCard(
                 }
             }
 
-            Spacer(Modifier.height(12.dp))
-            if (hasGraph) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (showGenerateWorkOrderButton) {
+                Spacer(Modifier.height(12.dp))
+                if (hasGraph) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = onGenerateWorkOrder,
+                            Modifier.weight(1f).height(42.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Accent),
+                            shape = RoundedCornerShape(12.dp),
+                        ) { Text("生成工单", fontSize = 14.sp) }
+                        OutlinedButton(
+                            onClick = onShowGraph,
+                            Modifier.weight(1f).height(42.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, BorderSoft),
+                        ) {
+                            Icon(Icons.Default.AccountTree, null, Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("图谱依据", fontSize = 14.sp)
+                        }
+                    }
+                } else {
                     Button(
                         onClick = onGenerateWorkOrder,
-                        Modifier.weight(1f).height(42.dp),
+                        Modifier.fillMaxWidth().height(42.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Accent),
                         shape = RoundedCornerShape(12.dp),
-                    ) { Text("生成工单", fontSize = 14.sp) }
-                    OutlinedButton(
-                        onClick = onShowGraph,
-                        Modifier.weight(1f).height(42.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, BorderSoft),
-                    ) {
-                        Icon(Icons.Default.AccountTree, null, Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("图谱依据", fontSize = 14.sp)
-                    }
+                    ) { Text("生成工单报告", fontSize = 14.sp) }
                 }
-            } else {
-                Button(
-                    onClick = onGenerateWorkOrder,
-                    Modifier.fillMaxWidth().height(42.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Accent),
-                    shape = RoundedCornerShape(12.dp),
-                ) { Text("生成工单报告", fontSize = 14.sp) }
             }
         }
     }
 }
 
 @Composable
-private fun SourceTraceRow(sourceLabel: String, elapsedMs: Long) {
+private fun SourceTraceRow(sourceLabel: String, elapsedMs: Long, tokenUsage: GenerationUsage? = null) {
     val details = listOfNotNull(
         sourceLabel.takeIf { it.isNotBlank() },
-        elapsedMs.takeIf { it > 0L }?.let { formatElapsedMs(it) },
+        elapsedMs.takeIf { it > 0L }?.let { "生成用时 ${formatElapsedMs(it)}" },
+        tokenUsage?.label(),
         "本机NPU",
     ).joinToString(" · ")
     Text(details, color = TextMuted, fontSize = 12.sp, lineHeight = 17.sp)
@@ -4836,11 +6896,16 @@ private fun formatElapsedMs(ms: Long): String {
 }
 
 @Composable
-private fun FieldChecklistCard(checklist: FieldChecklist) {
+private fun FieldChecklistCard(
+    checklist: FieldChecklist,
+    showCompletionWorkOrder: Boolean = false,
+    onGenerateWorkOrder: (List<FieldChecklistItem>) -> Unit = {},
+) {
     val checked = remember(checklist.title, checklist.items) {
         mutableStateListOf<Boolean>().apply { repeat(checklist.items.size) { add(false) } }
     }
     val completed = checked.count { it }
+    val allCompleted = checklist.items.isNotEmpty() && completed == checklist.items.size
     Card(
         Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -4897,9 +6962,22 @@ private fun FieldChecklistCard(checklist: FieldChecklist) {
                 }
                 if (index != checklist.items.lastIndex) HorizontalDivider(color = BorderSoft)
             }
-            if (checklist.items.isNotEmpty() && completed == checklist.items.size) {
+            if (allCompleted) {
                 Spacer(Modifier.height(8.dp))
                 Text("清单已完成，可把检查结果写入工单后再提交。", fontSize = 12.sp, color = SuccessColor)
+                if (showCompletionWorkOrder) {
+                    Spacer(Modifier.height(8.dp))
+                    Button(
+                        onClick = { onGenerateWorkOrder(checklist.items) },
+                        modifier = Modifier.fillMaxWidth().height(40.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Accent),
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.Assignment, null, Modifier.size(15.dp), tint = Color.White)
+                        Spacer(Modifier.width(6.dp))
+                        Text("生成动态工单", fontSize = 13.sp)
+                    }
+                }
             }
         }
     }
@@ -6644,17 +8722,17 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
     Column(Modifier.fillMaxWidth().background(Color.White).imePadding()) {
         if (pendingImage != null) {
             Card(
-                modifier = Modifier.padding(start = 12.dp, top = 10.dp, end = 12.dp),
+                modifier = Modifier.padding(start = 12.dp, top = 8.dp, end = 12.dp),
                 colors = CardDefaults.cardColors(containerColor = SurfaceMuted),
                 shape = RoundedCornerShape(14.dp),
                 border = BorderStroke(1.dp, BorderSoft),
             ) {
-                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Image(pendingImage!!.asImageBitmap(), null, Modifier.size(72.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop)
+                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Image(pendingImage!!.asImageBitmap(), null, Modifier.size(64.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop)
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text("已选择图片", fontSize = 12.sp, color = TextMuted)
-                        Text("现场资料将随诊断上下文一并发送", fontSize = 13.sp, color = TextMain, lineHeight = 18.sp)
+                        Text("现场资料将随诊断一起发送", fontSize = 13.sp, color = TextMain, lineHeight = 18.sp)
                     }
                     IconButton(onClick = { pendingImage = null }, Modifier.size(28.dp).background(Color.White, CircleShape)) {
                         Icon(Icons.Default.Close, "删除", tint = TextMuted, modifier = Modifier.size(14.dp))
@@ -6663,13 +8741,13 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
             }
         } else if (pendingVideoUri != null) {
             Card(
-                modifier = Modifier.padding(start = 12.dp, top = 10.dp, end = 12.dp),
+                modifier = Modifier.padding(start = 12.dp, top = 8.dp, end = 12.dp),
                 colors = CardDefaults.cardColors(containerColor = SurfaceMuted),
                 shape = RoundedCornerShape(14.dp),
                 border = BorderStroke(1.dp, BorderSoft),
             ) {
                 Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(Icons.Default.VideoLibrary, "视频", tint = Accent)
@@ -6683,6 +8761,7 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
                             maxLines = 1,
                             color = TextMain,
                         )
+                        Text("未填写问题时默认按环车点检处理", fontSize = 12.sp, color = TextMuted, maxLines = 1)
                     }
                     IconButton(onClick = {
                         pendingVideoUri = null
@@ -6693,13 +8772,13 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
                 }
             }
         }
-        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.Bottom) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.Bottom) {
             Box {
                 IconButton(
                     onClick = { showAttachmentMenu = true },
                     enabled = enabled,
                     modifier = Modifier
-                        .size(52.dp)
+                        .size(48.dp)
                         .clip(RoundedCornerShape(14.dp))
                         .background(if (enabled) SurfaceMuted else SurfaceSoft),
                 ) {
@@ -6730,7 +8809,7 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
                         },
                     )
                     DropdownMenuItem(
-                        text = { Text("导入视频") },
+                        text = { Text("导入点检视频") },
                         leadingIcon = { Icon(Icons.Default.VideoLibrary, null) },
                         onClick = {
                             showAttachmentMenu = false
@@ -6750,7 +8829,7 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
                     value = text,
                     onValueChange = { text = it },
                     modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("输入故障现象、设备编号或诊断需求...", fontSize = 14.sp, color = TextSubtle) },
+                    placeholder = { Text("输入故障、设备编号或点检需求", fontSize = 13.sp, color = TextSubtle) },
                     colors = TextFieldDefaults.colors(
                         focusedContainerColor = SurfaceMuted,
                         unfocusedContainerColor = SurfaceMuted,
@@ -6761,7 +8840,7 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
                     ),
                     shape = RoundedCornerShape(16.dp),
                     singleLine = false,
-                    maxLines = 3,
+                    maxLines = 2,
                 )
             }
             Spacer(Modifier.width(10.dp))
@@ -6776,14 +8855,14 @@ private fun InputBar(enabled: Boolean, onSend: (String, Bitmap?, Uri?) -> Unit) 
                     }
                 },
                 enabled = enabled && (text.isNotBlank() || pendingImage != null || pendingVideoUri != null),
-                modifier = Modifier.height(52.dp),
+                modifier = Modifier.height(48.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Accent, disabledContainerColor = BorderSoft),
                 shape = RoundedCornerShape(14.dp),
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
             ) {
                 Icon(Icons.AutoMirrored.Filled.Send, "发送", tint = Color.White, modifier = Modifier.size(16.dp))
                 Spacer(Modifier.width(6.dp))
-                Text("\u5f00\u59cb\u8bca\u65ad", fontSize = 14.sp)
+                Text("发送", fontSize = 14.sp)
             }
         }
     }

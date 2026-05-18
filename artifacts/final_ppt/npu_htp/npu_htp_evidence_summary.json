@@ -1,0 +1,10 @@
+﻿{
+    "log_file":  "artifacts/final_ppt/npu_htp/npu_htp_log_dump_after_run.txt",
+    "evidence_file":  "artifacts/final_ppt/npu_htp/npu_htp_evidence_excerpt.txt",
+    "has_libQnnHtp":  true,
+    "has_successfully_opened":  true,
+    "has_remote_handle64_open":  true,
+    "has_cdsp":  true,
+    "has_domain3":  true,
+    "verdict":  "成功使用 NPU HTP：日志包含 HTP 库加载、skel 文件打开、remote_handle64_open、_dom=cdsp、domain 3。"
+}

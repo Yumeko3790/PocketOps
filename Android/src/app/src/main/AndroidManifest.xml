@@ -78,6 +78,7 @@
             android:name="com.pocketops.app.GenieHttpService"
             android:enabled="true"
             android:exported="false"
+            android:process=":genie"
             android:foregroundServiceType="mediaPlayback" />
 
         <provider

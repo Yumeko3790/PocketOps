@@ -1,0 +1,762 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>PocketOps 决赛答辩</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#1a1f1e;
+  --surface:#232928;
+  --fg:#f0efeb;
+  --muted:#8a9490;
+  --border:#2e3634;
+  --accent:#3d9b8f;
+  --accent2:#c96442;
+  --font-display:'Noto Sans SC',system-ui,sans-serif;
+  --font-body:'Noto Sans SC',system-ui,sans-serif;
+  --font-mono:'JetBrains Mono','Fira Code',monospace;
+}
+html,body{width:100%;height:100%;overflow:hidden;background:#111;font-family:var(--font-body)}
+.deck{width:100%;height:100%;position:relative}
+.slide{
+  position:absolute;inset:0;
+  width:1920px;height:1080px;
+  transform-origin:top left;
+  display:none;flex-direction:column;
+  padding:80px 100px;
+  background:var(--bg);
+  color:var(--fg);
+  overflow:hidden;
+}
+.slide.active{display:flex}
+.slide h1{
+  font-family:var(--font-display);
+  font-size:52px;font-weight:700;
+  letter-spacing:-0.02em;line-height:1.2;
+  margin-bottom:32px;color:var(--fg);
+}
+.slide h2{
+  font-family:var(--font-display);
+  font-size:36px;font-weight:600;
+  letter-spacing:-0.01em;line-height:1.3;
+  margin-bottom:24px;color:var(--fg);
+}
+.slide h3{
+  font-size:24px;font-weight:600;
+  margin-bottom:16px;color:var(--accent);
+}
+.slide p,.slide li{
+  font-size:22px;line-height:1.6;
+  color:var(--muted);
+}
+.slide ul{list-style:none;padding:0}
+.slide ul li{
+  padding:8px 0 8px 24px;
+  position:relative;
+}
+.slide ul li::before{
+  content:'';position:absolute;left:0;top:18px;
+  width:8px;height:8px;border-radius:50%;
+  background:var(--accent);
+}
+.slide .tag{
+  display:inline-block;
+  font-size:13px;font-weight:600;
+  letter-spacing:0.08em;text-transform:uppercase;
+  color:var(--accent);
+  border:1px solid var(--accent);
+  padding:4px 12px;border-radius:4px;
+  margin-bottom:20px;
+}
+.slide .two-col{display:grid;grid-template-columns:1fr 1fr;gap:60px;flex:1}
+.slide .three-col{display:grid;grid-template-columns:1fr 1fr 1fr;gap:40px;flex:1}
+.slide .content-area{flex:1;display:flex;flex-direction:column;justify-content:center}
+.slide .card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:8px;padding:28px;
+}
+.slide .card h3{margin-bottom:12px}
+.slide .highlight-box{
+  background:linear-gradient(135deg,rgba(61,155,143,0.1),rgba(61,155,143,0.05));
+  border:1px solid rgba(61,155,143,0.3);
+  border-radius:8px;padding:24px;margin:16px 0;
+}
+.slide .code-block{
+  background:#111;border:1px solid var(--border);
+  border-radius:6px;padding:20px;
+  font-family:var(--font-mono);font-size:18px;
+  color:#7fdbca;line-height:1.7;
+  overflow:hidden;
+}
+.slide .evidence-line{
+  font-family:var(--font-mono);font-size:18px;
+  padding:6px 12px;margin:4px 0;
+  background:rgba(61,155,143,0.08);
+  border-left:3px solid var(--accent);
+  border-radius:0 4px 4px 0;
+  color:#b0d4cf;line-height:1.5;
+  overflow:hidden;white-space:nowrap;text-overflow:ellipsis;
+}
+.slide .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:24px;margin:24px 0}
+.slide .stat-item{text-align:center;padding:20px}
+.slide .stat-item .num{font-size:40px;font-weight:700;color:var(--accent);font-family:var(--font-mono)}
+.slide .stat-item .label{font-size:18px;color:var(--muted);margin-top:8px}
+.slide .flow-steps{
+  display:flex;align-items:center;gap:12px;
+  margin:24px 0;flex-wrap:wrap;
+}
+.slide .flow-step{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:6px;padding:14px 20px;
+  font-size:20px;color:var(--fg);
+  position:relative;
+}
+.slide .flow-arrow{color:var(--accent);font-size:20px}
+.slide .badge{
+  display:inline-block;
+  background:rgba(61,155,143,0.15);
+  color:var(--accent);
+  font-size:13px;font-weight:600;
+  padding:4px 10px;border-radius:4px;
+  margin:4px 4px 4px 0;
+}
+.slide .badge.warn{background:rgba(201,100,66,0.15);color:var(--accent2)}
+.counter{
+  position:fixed;bottom:24px;right:40px;
+  font-family:var(--font-mono);font-size:14px;
+  color:var(--muted);z-index:100;
+  background:rgba(0,0,0,0.5);padding:6px 14px;
+  border-radius:4px;
+}
+.nav-hint{
+  position:fixed;bottom:24px;left:40px;
+  font-size:12px;color:var(--muted);z-index:100;
+  opacity:0.5;
+}
+
+/* Cover slide special */
+.slide.cover{
+  justify-content:center;align-items:center;
+  text-align:center;
+  background:linear-gradient(160deg,#0f1413 0%,#1a2422 40%,#1f2b28 100%);
+}
+.slide.cover h1{font-size:64px;margin-bottom:16px;letter-spacing:-0.03em}
+.slide.cover .subtitle{font-size:26px;color:var(--muted);margin-bottom:48px;max-width:900px}
+.slide.cover .meta{font-size:18px;color:var(--muted);line-height:2}
+.slide.cover .brand-mark{
+  width:80px;height:80px;
+  border-radius:16px;
+  background:linear-gradient(135deg,var(--accent),#2a7a70);
+  display:flex;align-items:center;justify-content:center;
+  font-size:32px;font-weight:700;color:#fff;
+  margin-bottom:32px;
+}
+
+/* Section header slides */
+.slide.section-header{
+  justify-content:center;
+  background:linear-gradient(135deg,#0f1413,#162220);
+}
+.slide.section-header h1{font-size:56px;max-width:1200px}
+
+/* Architecture diagram */
+.arch-layer{
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:8px;padding:20px 28px;margin:12px 0;
+}
+.arch-layer .layer-title{
+  font-size:14px;font-weight:700;
+  letter-spacing:0.06em;text-transform:uppercase;
+  color:var(--accent);margin-bottom:12px;
+}
+.arch-layer .layer-items{
+  display:flex;flex-wrap:wrap;gap:10px;
+}
+.arch-layer .layer-item{
+  background:rgba(61,155,143,0.08);
+  border:1px solid rgba(61,155,143,0.2);
+  border-radius:4px;padding:6px 14px;
+  font-size:15px;color:var(--fg);
+}
+.arch-connector{
+  text-align:center;color:var(--accent);
+  font-size:24px;padding:4px 0;
+}
+
+/* Table */
+.slide table{
+  width:100%;border-collapse:collapse;
+  font-size:20px;
+}
+.slide table th{
+  text-align:left;padding:12px 16px;
+  background:var(--surface);
+  border-bottom:2px solid var(--accent);
+  color:var(--accent);font-weight:600;
+  font-size:18px;letter-spacing:0.06em;text-transform:uppercase;
+}
+.slide table td{
+  padding:10px 16px;
+  border-bottom:1px solid var(--border);
+  color:var(--muted);
+}
+.slide table tr:hover td{color:var(--fg)}
+
+/* Progress bar */
+.progress-bar{
+  width:100%;height:6px;
+  background:var(--border);border-radius:3px;
+  margin:12px 0;overflow:hidden;
+}
+.progress-bar .fill{
+  height:100%;border-radius:3px;
+  background:linear-gradient(90deg,var(--accent),#5bc4b6);
+}
+</style>
+
+<style id="pptx-export-style">
+  html, body, .deck { width:1920px!important; height:1080px!important; overflow:hidden!important; background:#111!important; }
+  .counter, .nav-hint { display:none!important; }
+  .slide { display:none!important; transform:none!important; }
+  .deck > .slide:nth-of-type(10) { display:flex!important; transform:none!important; }
+</style>
+<script>try{localStorage.setItem('pocketops-deck-pos','9');}catch(e){}</script>
+</head>
+<body>
+<div class="deck" id="deck">
+
+<!-- Slide 1: Cover -->
+<section class="slide cover active" data-screen-label="01 封面">
+  <div class="brand-mark" style="border-radius:8px;background:var(--surface);border:2px solid var(--accent)">
+    <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
+      <rect x="6" y="8" width="28" height="24" rx="3" stroke="var(--accent)" stroke-width="2" fill="none"/>
+      <circle cx="20" cy="20" r="6" stroke="var(--accent)" stroke-width="2" fill="none"/>
+      <path d="M20 14v12M14 20h12" stroke="var(--accent)" stroke-width="1.5"/>
+    </svg>
+  </div>
+  <h1>PocketOps</h1>
+  <div class="subtitle">面向工业车辆维保现场的端侧 AI 诊断与工单闭环系统</div>
+  <div class="meta">
+    无公网现场，也能完成 AI 诊断与工单闭环<br>
+    <span style="color:var(--accent)">端侧 NPU · 本地知识图谱 · 多模态识别 · 动态工单</span>
+  </div>
+</section>
+
+<!-- Slide 2: TOC -->
+<section class="slide" data-screen-label="02 目录">
+  <span class="tag">答辩目录</span>
+  <h1>汇报提纲</h1>
+  <div class="two-col">
+    <div>
+      <ul style="font-size:26px">
+        <li><strong style="color:var(--fg)">01</strong>&nbsp; 项目背景与痛点</li>
+        <li><strong style="color:var(--fg)">02</strong>&nbsp; 方案简介与核心价值</li>
+        <li><strong style="color:var(--fg)">03</strong>&nbsp; 系统架构与技术框架</li>
+        <li><strong style="color:var(--fg)">04</strong>&nbsp; 骁龙端侧部署</li>
+      </ul>
+    </div>
+    <div>
+      <ul style="font-size:26px">
+        <li><strong style="color:var(--fg)">05</strong>&nbsp; 手机 NPU HTP 验证</li>
+        <li><strong style="color:var(--fg)">06</strong>&nbsp; 现场演示路径</li>
+        <li><strong style="color:var(--fg)">07</strong>&nbsp; 成果验证与完成度</li>
+        <li><strong style="color:var(--fg)">08</strong>&nbsp; 总结与落地展望</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 3: Basic Info -->
+<section class="slide" data-screen-label="03 基本信息">
+  <span class="tag">基本信息</span>
+  <h1>PocketOps：离线现场诊断与动态工单助手</h1>
+  <div class="two-col">
+    <div>
+      <h3>项目信息</h3>
+      <table>
+        <tr><td style="color:var(--accent);width:140px">方案名称</td><td style="color:var(--fg)">PocketOps</td></tr>
+        <tr><td style="color:var(--accent)">项目定位</td><td style="color:var(--fg)">工业车辆维保现场的端侧 AI 诊断助手</td></tr>
+        <tr><td style="color:var(--accent)">运行形态</td><td style="color:var(--fg)">Android 真机 + 本机 NPU 推理服务</td></tr>
+        <tr><td style="color:var(--accent)">主链路</td><td style="color:var(--fg)">离线诊断、图谱依据、动态工单、本机队列</td></tr>
+        <tr><td style="color:var(--accent)">增强服务</td><td style="color:var(--fg)">局域网资料同步与工单归档 demo server</td></tr>
+        <tr><td style="color:var(--accent)">答辩口径</td><td style="color:var(--fg)">蓝牙诊断采集为模拟链路，不宣称真实接入车辆控制器</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>项目概述</h3>
+      <p style="font-size:20px;line-height:1.8;color:var(--fg)">
+        PocketOps 为工业车辆维保人员提供一套可离线运行的手机端 AI 诊断工作台，用端侧模型和本地知识图谱把现场故障、图片视频、维修步骤和工单提交连接起来。
+      </p>
+      <div style="margin-top:24px;display:flex;flex-wrap:wrap;gap:8px">
+        <span class="badge">端侧 AI</span>
+        <span class="badge">本机 NPU</span>
+        <span class="badge">GraphRAG</span>
+        <span class="badge">多模态识别</span>
+        <span class="badge">离线诊断</span>
+        <span class="badge">动态工单</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 4: Background -->
+<section class="slide" data-screen-label="04 项目背景">
+  <span class="tag">项目背景</span>
+  <h1>工业车辆维保现场：网络弱、资料散、经验强依赖</h1>
+  <div class="two-col">
+    <div>
+      <h3>典型痛点</h3>
+      <ul>
+        <li><strong style="color:var(--fg)">弱网环境</strong> — 仓库、厂区、地下区域公网不可用</li>
+        <li><strong style="color:var(--fg)">资料分散</strong> — 手册、工单、备件信息散落各系统</li>
+        <li><strong style="color:var(--fg)">经验依赖</strong> — 新手难判断排查顺序，老手经验难复用</li>
+        <li><strong style="color:var(--fg)">工单缺项</strong> — 设备编号、参数、步骤经常缺失</li>
+        <li><strong style="color:var(--fg)">图片未结构化</strong> — 现场照片难以进入诊断流程</li>
+      </ul>
+    </div>
+    <div>
+      <h3>目标用户</h3>
+      <div class="card" style="margin-bottom:16px">
+        <p style="color:var(--fg)">一线维修工程师 · 售后服务人员 · 设备主管 · 维保外包团队</p>
+      </div>
+      <h3>切入点</h3>
+      <div class="highlight-box">
+        <p style="color:var(--fg);font-size:20px">把"现场诊断 + 多模态采集 + 知识图谱 + 工单闭环"放进手机端</p>
+      </div>
+      <h3 style="margin-top:20px">应用场景</h3>
+      <p>仓储、制造、物流园区中的叉车、AGV、搬运车等工业车辆维保</p>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 5: Solution -->
+<section class="slide" data-screen-label="05 方案简介">
+  <span class="tag">核心方案</span>
+  <h1>端侧 AI + 本地知识图谱 + 动态工单闭环</h1>
+  <div class="three-col" style="margin-top:16px">
+    <div class="card">
+      <h3>离线端侧诊断</h3>
+      <p>本机知识图谱 + 本机 HTTP 推理服务，不依赖公网完成主诊断流程</p>
+    </div>
+    <div class="card">
+      <h3>图谱增强生成</h3>
+      <p>图谱锁定事实（设备/症状/根因/备件/步骤），大模型只补充推理依据</p>
+    </div>
+    <div class="card">
+      <h3>多模态现场输入</h3>
+      <p>文字、零件图片、铭牌图片、现场视频、故障码与参数</p>
+    </div>
+  </div>
+  <div style="margin-top:32px">
+    <h3>工作流</h3>
+    <div class="flow-steps">
+      <div class="flow-step">文字/图片/视频输入</div>
+      <span class="flow-arrow">&rarr;</span>
+      <div class="flow-step">本地 GraphRAG 匹配</div>
+      <span class="flow-arrow">&rarr;</span>
+      <div class="flow-step">端侧模型补充推理</div>
+      <span class="flow-arrow">&rarr;</span>
+      <div class="flow-step">诊断卡片 + 排查清单</div>
+      <span class="flow-arrow">&rarr;</span>
+      <div class="flow-step">动态工单 + 离线提交</div>
+    </div>
+  </div>
+  <div class="two-col" style="margin-top:24px">
+    <div class="card">
+      <h3>动态工单闭环</h3>
+      <p>连续问答、图片分析、设备上下文、用户补充参数和已完成排查项被汇总进工单，支持质量检查和离线队列</p>
+    </div>
+    <div class="card">
+      <h3>局域网增强服务</h3>
+      <p>电脑侧 demo server 提供资料同步、附件下载、工单归档，不参与主诊断依赖</p>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 6: Architecture -->
+<section class="slide" data-screen-label="06 系统架构">
+  <span class="tag">技术架构</span>
+  <h1>端侧主链路，局域网服务可选增强</h1>
+  <div style="flex:1;display:flex;flex-direction:column;justify-content:center">
+    <div class="arch-layer">
+      <div class="layer-title">输入层</div>
+      <div class="layer-items">
+        <span class="layer-item">文字故障描述</span>
+        <span class="layer-item">零件/铭牌图片</span>
+        <span class="layer-item">现场视频</span>
+        <span class="layer-item">故障码与参数</span>
+        <span class="layer-item">历史对话上下文</span>
+      </div>
+    </div>
+    <div class="arch-connector">&darr;</div>
+    <div class="arch-layer" style="border-color:var(--accent)">
+      <div class="layer-title">端侧智能层 — PocketOps Android</div>
+      <div class="layer-items">
+        <span class="layer-item">本地 GraphRAG 知识图谱 (84节点/84边)</span>
+        <span class="layer-item">本机推理 127.0.0.1:8910</span>
+        <span class="layer-item">NPU 模型 qwen2.5vl-3b</span>
+        <span class="layer-item">图片 base64 编码</span>
+        <span class="layer-item">视频抽帧 + contact sheet</span>
+        <span class="layer-item">端侧问诊/泛化</span>
+      </div>
+    </div>
+    <div class="arch-connector">&darr;</div>
+    <div class="arch-layer">
+      <div class="layer-title">输出与闭环层</div>
+      <div class="layer-items">
+        <span class="layer-item">结构化诊断卡片</span>
+        <span class="layer-item">图谱依据/相似工单</span>
+        <span class="layer-item">离线排查清单</span>
+        <span class="layer-item">动态工单 + 质量检查</span>
+        <span class="layer-item">本机队列/局域网补交</span>
+      </div>
+    </div>
+  </div>
+  <div style="display:flex;gap:16px;margin-top:16px;flex-wrap:wrap">
+    <span class="badge">Kotlin + Jetpack Compose</span>
+    <span class="badge">Material 3</span>
+    <span class="badge">OpenAI-compatible API</span>
+    <span class="badge">GenieHttpService</span>
+    <span class="badge">arm64-v8a</span>
+  </div>
+</section>
+
+<!-- Slide 7: Qualcomm Deployment -->
+<section class="slide" data-screen-label="07 骁龙端侧部署">
+  <span class="tag">骁龙平台</span>
+  <h1>把多模态诊断放在移动设备上运行</h1>
+  <div class="two-col">
+    <div>
+      <h3>端侧部署方案</h3>
+      <table>
+        <tr><td style="color:var(--accent);width:160px">推理位置</td><td style="color:var(--fg)">本机 NPU / 端侧推理服务</td></tr>
+        <tr><td style="color:var(--accent)">本机端口</td><td style="color:var(--fg);font-family:var(--font-mono)">127.0.0.1:8910</td></tr>
+        <tr><td style="color:var(--accent)">运行模型</td><td style="color:var(--fg);font-family:var(--font-mono)">qwen2.5vl-3b-8850-2.42</td></tr>
+        <tr><td style="color:var(--accent)">模型目录</td><td style="color:var(--fg);font-family:var(--font-mono)">/sdcard/GenieModels/</td></tr>
+        <tr><td style="color:var(--accent)">ABI</td><td style="color:var(--fg);font-family:var(--font-mono)">arm64-v8a</td></tr>
+        <tr><td style="color:var(--accent)">NPU 证明</td><td style="color:var(--fg)">adb logcat HTP/CDSP 日志</td></tr>
+      </table>
+      <h3 style="margin-top:28px">Android 运行环境</h3>
+      <table>
+        <tr><td style="color:var(--accent);width:160px">applicationId</td><td style="color:var(--fg);font-family:var(--font-mono)">com.pocketops.app</td></tr>
+        <tr><td style="color:var(--accent)">版本</td><td style="color:var(--fg)">v4.8 (code 48)</td></tr>
+        <tr><td style="color:var(--accent)">SDK</td><td style="color:var(--fg)">min 31 / target 35 / compile 35</td></tr>
+        <tr><td style="color:var(--accent)">推理服务</td><td style="color:var(--fg);font-family:var(--font-mono)">GenieHttpService</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>为什么适合骁龙平台</h3>
+      <ul>
+        <li><strong style="color:var(--fg)">实时性</strong> — 现场交互需低延迟，端侧推理减少网络往返</li>
+        <li><strong style="color:var(--fg)">弱网可用</strong> — 仓储厂区网络不稳定，端侧保障主流程</li>
+        <li><strong style="color:var(--fg)">隐私安全</strong> — 设备编号、故障码等敏感数据留在本机</li>
+        <li><strong style="color:var(--fg)">多模态移动性</strong> — 手机直接拍照、录视频、生成工单</li>
+        <li><strong style="color:var(--fg)">计算效率</strong> — NPU 加速适合多模态模型持续交互</li>
+      </ul>
+      <div class="highlight-box" style="margin-top:24px">
+        <p style="color:var(--fg);font-size:18px">
+          <strong>关键工程方法：</strong>启动时加载知识图谱 &rarr; 检查本机推理服务 &rarr; 轮询 /v1/models &rarr; 每次诊断前 /clear 清理状态 &rarr; 流式文本 + 非流式多模态
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 8: NPU HTP Verification -->
+<section class="slide" data-screen-label="08 NPU HTP 验证">
+  <span class="tag" style="border-color:var(--accent2);color:var(--accent2)">NPU 使用证明</span>
+  <h1>手机端 NPU HTP 使用验证</h1>
+  <div class="two-col">
+    <div>
+      <h3>验证流程</h3>
+      <div class="code-block" style="font-size:18px;margin-bottom:20px">
+        <span style="color:#c792ea">$</span> adb logcat -c<br>
+        <span style="color:#c792ea">$</span> adb logcat > log.txt<br>
+        <span style="color:#82aaff"># 手机上触发 PocketOps 推理</span><br>
+        <span style="color:#c792ea">$</span> Select-String -Path log.txt \<br>
+        &nbsp;&nbsp;-Pattern <span style="color:#c3e88d">"libQnnHtp|remote_handle64_open|_dom=cdsp|domain 3"</span>
+      </div>
+      <h3>关键证据判定</h3>
+      <table>
+        <tr><th>日志关键字</th><th>证明含义</th></tr>
+        <tr><td style="font-family:var(--font-mono);color:#7fdbca">libQnnHtpV81Skel.so</td><td>QNN HTP 库被加载</td></tr>
+        <tr><td style="font-family:var(--font-mono);color:#7fdbca">Successfully opened file</td><td>HTP skel 库成功打开</td></tr>
+        <tr><td style="font-family:var(--font-mono);color:#7fdbca">remote_handle64_open</td><td>DSP 远程句柄建立</td></tr>
+        <tr><td style="font-family:var(--font-mono);color:#7fdbca">_dom=cdsp</td><td>使用 Compute DSP 域</td></tr>
+        <tr><td style="font-family:var(--font-mono);color:#7fdbca">domain 3</td><td>Hexagon CDSP 确认</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>实际导出日志摘录</h3>
+      <div style="background:#0d1210;border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:16px">
+        <div class="evidence-line">
+          <span style="color:#546e7a">10:03:29.357</span> Successfully opened file .../libQnnHtpV81Skel.so
+        </div>
+        <div class="evidence-line" style="border-left-color:var(--accent2)">
+          <span style="color:#546e7a">10:03:29.390</span> remote_handle64_open: opened handle ... <strong style="color:#fff">_dom=cdsp</strong> on <strong style="color:#fff">domain 3</strong>
+        </div>
+        <div class="evidence-line">
+          <span style="color:#546e7a">10:03:36.667</span> Successfully opened file .../libQnnHtpV81Skel.so
+        </div>
+        <div class="evidence-line" style="border-left-color:var(--accent2)">
+          <span style="color:#546e7a">10:03:36.700</span> remote_handle64_open: opened handle ... <strong style="color:#fff">_dom=cdsp</strong> on <strong style="color:#fff">domain 3</strong>
+        </div>
+        <div class="evidence-line">
+          <span style="color:#546e7a">10:03:44.486</span> remote_handle64_open: ... <strong style="color:#fff">_dom=cdsp</strong>&_session=2 on <strong style="color:#fff">domain 11</strong>
+        </div>
+      </div>
+      <div class="highlight-box" style="background:rgba(201,100,66,0.1);border-color:rgba(201,100,66,0.4)">
+        <p style="color:var(--fg);font-size:18px;font-weight:600">
+          结论：日志包含 HTP 库加载 + CDSP 远程句柄建立，<br>证明端侧推理已成功使用手机 NPU HTP
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 9: Demo Path -->
+<section class="slide" data-screen-label="09 现场演示">
+  <span class="tag">现场演示</span>
+  <h1>从故障输入到动态工单</h1>
+  <div class="flow-steps" style="margin:20px 0 32px">
+    <div class="flow-step" style="border-color:var(--accent)"><strong style="color:var(--accent)">1</strong>&nbsp; 启动就绪</div>
+    <span class="flow-arrow">&rarr;</span>
+    <div class="flow-step" style="border-color:var(--accent)"><strong style="color:var(--accent)">2</strong>&nbsp; 文字诊断</div>
+    <span class="flow-arrow">&rarr;</span>
+    <div class="flow-step" style="border-color:var(--accent)"><strong style="color:var(--accent)">3</strong>&nbsp; 图谱依据</div>
+    <span class="flow-arrow">&rarr;</span>
+    <div class="flow-step" style="border-color:var(--accent)"><strong style="color:var(--accent)">4</strong>&nbsp; 图文追问</div>
+    <span class="flow-arrow">&rarr;</span>
+    <div class="flow-step" style="border-color:var(--accent)"><strong style="color:var(--accent)">5</strong>&nbsp; 动态工单</div>
+  </div>
+  <div class="two-col" style="flex:1">
+    <div>
+      <h3>主线演示步骤</h3>
+      <ul style="font-size:20px">
+        <li><strong style="color:var(--fg)">启动就绪</strong> — 登录、知识库加载、NPU 服务就绪</li>
+        <li><strong style="color:var(--fg)">图谱增强诊断</strong> — 输入"3号叉车举升缓慢，液压压力偏低"，展示诊断卡片</li>
+        <li><strong style="color:var(--fg)">图谱依据</strong> — 知识图谱视图、相似工单、排查清单</li>
+        <li><strong style="color:var(--fg)">图文追问</strong> — 上传零件图"这是什么零件？"、铭牌图"配置号是多少？"</li>
+        <li><strong style="color:var(--fg)">端侧问诊</strong> — 短症状输入，补充参数，排查清单全选后"生成动态工单"</li>
+        <li><strong style="color:var(--fg)">工单闭环</strong> — 质量检查、离线队列、局域网补交</li>
+      </ul>
+    </div>
+    <div>
+      <h3>补充演示功能</h3>
+      <ul style="font-size:20px">
+        <li><strong style="color:var(--fg)">知识库未命中</strong> — "AGV 偶发急停"，展示端侧泛化诊断</li>
+        <li><strong style="color:var(--fg)">NPU 证明</strong> — 触发推理 + adb logcat 导出 HTP 日志</li>
+        <li><strong style="color:var(--fg)">离线提交</strong> — 关闭服务，工单进入待提交队列</li>
+        <li><strong style="color:var(--fg)">模拟蓝牙采集</strong> — 电池电压 9.2V、液压 0.8bar</li>
+        <li><strong style="color:var(--fg)">历史搜索</strong> — 按图谱/图片/视频/工单筛选</li>
+      </ul>
+      <div class="highlight-box" style="margin-top:20px">
+        <p style="font-size:18px;color:var(--fg)"><strong>兜底策略：</strong>模型加载慢则先播录屏；服务不可用则展示离线队列；时间不足则只走启动→诊断→追问→工单四步</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 10: Results -->
+<section class="slide" data-screen-label="10 项目成果">
+  <span class="tag">成果验证</span>
+  <h1>已实现成果：可运行、可演示、可闭环</h1>
+  <div class="stat-grid">
+    <div class="stat-item card">
+      <div class="num">v4.8</div>
+      <div class="label">Android 应用版本</div>
+    </div>
+    <div class="stat-item card">
+      <div class="num">84</div>
+      <div class="label">知识图谱节点</div>
+    </div>
+    <div class="stat-item card">
+      <div class="num">3</div>
+      <div class="label">核心 API 接口</div>
+    </div>
+    <div class="stat-item card">
+      <div class="num" style="font-size:32px">HTP</div>
+      <div class="label">NPU 验证通过</div>
+    </div>
+  </div>
+  <div class="two-col" style="flex:1">
+    <div>
+      <h3>已完成功能</h3>
+      <ul style="font-size:20px">
+        <li>本机推理服务接入 (GenieHttpService)</li>
+        <li>本地 GraphRAG 知识图谱</li>
+        <li>文字诊断 — 图谱优先 + 端侧泛化</li>
+        <li>图片诊断 — 零件/铭牌/故障部位</li>
+        <li>视频诊断 — 关键帧抽取 + VLM</li>
+        <li>端侧问诊 — 追问参数 + 排查清单</li>
+        <li>动态工单 — 多轮汇总 + 质量检查</li>
+        <li>离线队列 + 局域网补交</li>
+      </ul>
+    </div>
+    <div>
+      <h3>验证维度</h3>
+      <ul style="font-size:20px">
+        <li><strong style="color:var(--fg)">完整性</strong> — 故障输入到工单提交形成闭环</li>
+        <li><strong style="color:var(--fg)">离线性</strong> — 无公网完成诊断主流程</li>
+        <li><strong style="color:var(--fg)">可解释性</strong> — 图谱依据、相似工单可见</li>
+        <li><strong style="color:var(--fg)">工程可用性</strong> — 真机运行、前台服务</li>
+        <li><strong style="color:var(--fg)">NPU 使用</strong> — HTP 日志证明</li>
+      </ul>
+      <div style="margin-top:20px">
+        <h3>完成度</h3>
+        <div style="display:flex;align-items:center;gap:12px">
+          <div class="progress-bar" style="flex:1"><div class="fill" style="width:88%"></div></div>
+          <span style="color:var(--accent);font-family:var(--font-mono);font-size:20px;font-weight:700">~88%</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 11: Summary -->
+<section class="slide" data-screen-label="11 总结展望">
+  <span class="tag">总结</span>
+  <h1>让工业车辆维保从"经验驱动"走向"端侧智能闭环"</h1>
+  <div class="two-col" style="flex:1">
+    <div>
+      <h3>项目优势</h3>
+      <ul style="font-size:20px">
+        <li><strong style="color:var(--fg)">产品价值清晰</strong> — 面向真实维保痛点，诊断+资料+追问+工单串成现场流程</li>
+        <li><strong style="color:var(--fg)">技术路径可落地</strong> — GraphRAG 锁定事实，端侧模型补充推理，减少不确定性</li>
+        <li><strong style="color:var(--fg)">骁龙端侧优势</strong> — 手机可移动、可拍摄、可离线、可本机推理</li>
+        <li><strong style="color:var(--fg)">演示完成度高</strong> — 主线已打通，可现场演示完整流程</li>
+      </ul>
+      <h3 style="margin-top:28px">落地空间</h3>
+      <ul style="font-size:20px">
+        <li>工业车辆售后：叉车、AGV、搬运车</li>
+        <li>仓储园区维保：现场快速排障</li>
+        <li>设备厂商售后：标准化维修 SOP</li>
+        <li>维保培训：新手学习处理流程</li>
+      </ul>
+    </div>
+    <div>
+      <h3>未来迭代方向</h3>
+      <ul style="font-size:20px">
+        <li>接入真实车载控制器 / 蓝牙诊断协议</li>
+        <li>扩充知识图谱规模，接入企业设备档案</li>
+        <li>增加模型量化与性能优化数据</li>
+        <li>支持更多工业设备类型</li>
+        <li>工单服务升级为企业级 CMMS/EAM 集成</li>
+      </ul>
+      <div class="highlight-box" style="margin-top:32px;text-align:center">
+        <p style="color:var(--fg);font-size:22px;font-weight:600">
+          PocketOps 让一线工程师在无公网现场<br>也能完成可靠、可追溯、可交付的<br>AI 诊断与工单闭环
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Slide 12: Appendix -->
+<section class="slide" data-screen-label="12 附录">
+  <span class="tag">附录</span>
+  <h1>技术参数与补充材料</h1>
+  <div class="two-col" style="flex:1">
+    <div>
+      <h3>技术参数表</h3>
+
+      <table style="font-size:18px">
+        <tr><td style="color:var(--accent)">App</td><td style="color:var(--fg)">PocketOps v4.8</td></tr>
+        <tr><td style="color:var(--accent)">applicationId</td><td style="color:var(--fg);font-family:var(--font-mono)">com.pocketops.app</td></tr>
+        <tr><td style="color:var(--accent)">SDK</td><td style="color:var(--fg)">min31 / target35 / compile35</td></tr>
+        <tr><td style="color:var(--accent)">ABI</td><td style="color:var(--fg);font-family:var(--font-mono)">arm64-v8a</td></tr>
+        <tr><td style="color:var(--accent)">推理服务</td><td style="color:var(--fg);font-family:var(--font-mono)">GenieHttpService</td></tr>
+        <tr><td style="color:var(--accent)">本机端口</td><td style="color:var(--fg);font-family:var(--font-mono)">127.0.0.1:8910</td></tr>
+        <tr><td style="color:var(--accent)">模型</td><td style="color:var(--fg);font-family:var(--font-mono)">qwen2.5vl-3b-8850-2.42</td></tr>
+        <tr><td style="color:var(--accent)">知识图谱</td><td style="color:var(--fg)">84 nodes / 84 edges</td></tr>
+        <tr><td style="color:var(--accent)">NPU 证明</td><td style="color:var(--fg)">HTP + CDSP 日志验证通过</td></tr>
+      </table>
+      <h3 style="margin-top:24px">知识图谱结构</h3>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
+        <span class="badge">设备 5</span>
+        <span class="badge">故障症状 8</span>
+        <span class="badge">根因 18</span>
+        <span class="badge">备件 15</span>
+        <span class="badge">维修步骤 20</span>
+        <span class="badge">人员 6</span>
+        <span class="badge">工单 12</span>
+      </div>
+    </div>
+    <div>
+      <h3>服务接口</h3>
+      <div class="code-block" style="font-size:16px;margin-bottom:16px">
+        <span style="color:#82aaff">本机推理：</span><br>
+        GET&nbsp; /v1/models<br>
+        POST /v1/chat/completions<br>
+        POST /clear<br><br>
+        <span style="color:#82aaff">局域网 demo server：</span><br>
+        POST /api/pocketops/auth/login<br>
+        GET&nbsp; /api/pocketops/bootstrap/manifest<br>
+        POST /api/pocketops/materials/query<br>
+        POST /api/pocketops/work-orders/submit<br>
+        GET&nbsp; /api/pocketops/work-orders/submitted
+      </div>
+      <h3>演示准备</h3>
+      <ul style="font-size:18px">
+        <li>设备：组委会发放 Android 真机</li>
+        <li>联网：主诊断不需公网</li>
+        <li>账号：engineer / PocketOps@2026</li>
+        <li>备用：1-3 分钟兜底录屏</li>
+        <li>NPU：adb logcat 现场导出</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+</div><!-- end .deck -->
+
+<div class="counter"><span id="current">1</span> / <span id="total">12</span></div>
+<div class="nav-hint">← → 或点击翻页</div>
+
+<script>
+(function(){
+  const slides = document.querySelectorAll('.slide');
+  const total = slides.length;
+  let current = parseInt(localStorage.getItem('pocketops-deck-pos') || '0', 10);
+  if(current < 0 || current >= total) current = 0;
+
+  function show(idx){
+    slides.forEach((s,i) => s.classList.toggle('active', i === idx));
+    current = idx;
+    localStorage.setItem('pocketops-deck-pos', current);
+    document.getElementById('current').textContent = current + 1;
+    document.getElementById('total').textContent = total;
+    resize();
+  }
+
+  function resize(){
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const scale = Math.min(vw / 1920, vh / 1080);
+    slides.forEach(s => {
+      s.style.transform = 'scale(' + scale + ')';
+    });
+  }
+
+  function next(){ show(current < total - 1 ? current + 1 : current); }
+  function prev(){ show(current > 0 ? current - 1 : current); }
+
+  document.addEventListener('keydown', e => {
+    if(e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') next();
+    else if(e.key === 'ArrowLeft' || e.key === 'PageUp') prev();
+  });
+
+  document.addEventListener('click', e => {
+    const x = e.clientX / window.innerWidth;
+    if(x > 0.5) next(); else prev();
+  });
+
+  window.addEventListener('resize', resize);
+  show(current);
+})();
+</script>
+</body>
+</html>
